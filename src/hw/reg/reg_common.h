@@ -10,11 +10,13 @@
 #define SP			0x10012000
 
 #define CM3_NVIC_ISER		REG(0xe000e100)
+#define CM3_SCB_VTOR		REG(0xe000ed08)
 
 #define CM3_MBOX_BASE		0x50010000
 
 /* Registers below found by R: https://github.com/ArcaneNibble/m1n1.git */
 #define CM3_MBOX_IRQEN_0	REG(CM3_MBOX_BASE + 0x10)
+#define CM3_MBOX_IRQEN(n)	REG(CM3_MBOX_BASE + 0x14 + ((n) * 4))
 #define CM3_MBOX_IRQCLR_0	REG(CM3_MBOX_BASE + 0x2c)
 
 #define CM3_MBOX0_STATUS	REG(CM3_MBOX_BASE + 0x50)

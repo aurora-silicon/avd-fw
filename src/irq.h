@@ -22,6 +22,7 @@
 	}
 
 void irq_handler(void);
+void avd_reset_decoder_blocks(void);
 void irq_nmi(void);
 void irq_hardfault(void);
 void irq_memmanage(void);
