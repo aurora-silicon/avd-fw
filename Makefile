@@ -31,7 +31,10 @@ LAST_BUILT := $(shell echo "$(CFLAGS)" | cmp -s .flags || echo "$(CFLAGS)" > .fl
 
 NAME = avd-fw-v$(AVD_VER)-t$(AVD_TIER)
 
-OBJECTS := util.o irq.o avd.o
+# Keep the reset path at the start of .text.  The AVD CM3 boot path used on
+# t8140 is only hardware-verified with _start at 0x0c70; placing avd.o last
+# moves it behind the full IRQ trampoline table.
+OBJECTS := avd.o irq.o util.o
 
 BUILD_OBJS := $(patsubst %,build/%,$(OBJECTS))
 
@@ -41,7 +44,7 @@ clean:
 	rm -rf build/*
 
 build/$(NAME).elf: $(BUILD_OBJS)
-	$(CC) $(CFLAGS) -T $(LD_SCRIPT) -o $@ $^
+	$(CC) $(CFLAGS) -fuse-ld=lld -T $(LD_SCRIPT) -o $@ $^
 
 build/%.o: src/%.c .flags
 	mkdir -p "$(dir $@)"
