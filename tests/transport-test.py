@@ -44,11 +44,12 @@ class Transport:
         self.stores, self.kicks, self.notifications, self.fetches = [], [], [], []
         self.busy, self.full, self.dma_ticks, self.dma_timeout = False, False, 0, False
         self.clear = set()
+        self.level_reads = 0
         self.uc.hook_add(UC_HOOK_MEM_READ, self.read)
         self.uc.hook_add(UC_HOOK_MEM_WRITE, self.write)
         self.call("avdq_fw_init")
         self.info = [self.u32(0x10007fc0 + i * 4) for i in range(11)]
-        assert self.info[:4] == [0x41565131, 1, 16, 64]
+        assert self.info[:4] == [0x41565131, 2, 16, 64]
         expected = 0x0108c000 if self.version == 2 else 0x01090000 if self.version == 3 or (self.version == 5 and self.tier == 0) else 0x01094000 if (self.version == 5 and self.tier == 2) else 0x01092000
         assert self.info[4] == expected and self.info[8] == self.vps
         assert self.info[10] == (7 if self.version == 2 or (self.version == 5 and self.tier == 0) else 15)
@@ -78,6 +79,7 @@ class Transport:
         if self.decode + self.maximum <= addr < self.decode + self.maximum + self.vps * 4:
             self.put(addr, 256)
         if self.decode + self.current <= addr < self.decode + self.current + self.vps * 4:
+            self.level_reads += 1
             self.put(addr, 256 if self.full else 0)
         if addr == self.dma + 4:
             if self.dma_timeout:
@@ -99,7 +101,7 @@ class Transport:
             self.dma_ticks = 3
             self.put(self.dma + 4, 0)
         if self.decode + self.fifo <= addr < self.decode + self.fifo + self.vps * 4:
-            self.stores.append(value)
+            self.stores.append(((addr - self.decode - self.fifo) // 4, value))
         if addr == self.decode + self.pp:
             self.kicks.append(value)
         if addr == 0x50010060:
@@ -111,12 +113,12 @@ class Transport:
         if status <= addr <= status + 13 * 4:
             self.clear.add(addr)
 
-    def submit(self, idx, tag, words, vp=0):
+    def submit(self, idx, tag, words, codec=0, context=0, dep=0, segments=1):
         source = 0x100004000 + idx * 0x10000
         for p in range((len(words) + 255) // 256):
             self.packets[source + p * 1028] = (self.info[7], words[p * 256:(p + 1) * 256])
-        desc = [0x41565131, tag, 0, vp, source & 0xffffffff, source >> 32,
-                len(words), 0x2b000400 | idx << 4, 1, 0, 0, 0, 0, 0, 0, 0]
+        desc = [0x41565131, tag, codec, idx, source & 0xffffffff, source >> 32,
+                len(words), segments, 1, 0, 0, context, dep, 0x1000000 + idx * 0x1000000, 0, 0]
         self.uc.mem_write(0x10008000 + idx * 64, struct.pack("<16I", *desc))
         # Exercise the actual mailbox IRQ wrapper and interrupt acknowledgement.
         self.put(0x50010058, self.ring + idx * 64)
@@ -126,8 +128,11 @@ class Transport:
         for _ in range(n):
             self.call("avdq_fw_poll")
 
-    def vp_done(self):
-        self.call("irq20" if self.version == 2 else "irq80")
+    def vp_done(self, vp=0):
+        self.call(f"irq{20 + vp * 5 if self.version <= 3 else 80 + vp * 5}")
+
+    def not_full(self, vp=0):
+        self.call(f"irq{21 + vp * 5 if self.version <= 3 else 81 + vp * 5}")
 
     def pp_done(self):
         self.call("irq40" if self.version == 2 else "irq64")
@@ -138,67 +143,87 @@ class Transport:
 
 def check(image):
     t = Transport(image)
-    # Legacy outputs before the first queue doorbell are unchanged.
-    t.vp_done()
-    assert t.notifications == [0x100]
-    t.busy = False
-    t.pp_done()
-    assert t.notifications[-1] == 0x1000
-    t.busy = False
-    t.notifications.clear()
+    # Distinct contexts occupy both HEVC engines, including tier 0.
     words = list(range(513))
-    t.submit(0, 0xabcd0000, words)
-    t.submit(1, 0x12340001, [0xfeed])
+    t.submit(0, 0xabcd0000, words, context=10, dep=1, segments=3)
+    t.submit(1, 0x12340001, [0xfeed], context=20, dep=1)
     t.full = True
     t.poll(20)
-    assert not t.stores and len(t.fetches) == 1
+    reads = t.level_reads
+    t.poll(20)
+    assert not t.stores and len(t.fetches) == 1 and t.level_reads == reads
+    # Draining alone does not cause software to busy poll the VP queue.
     t.full = False
+    t.poll(10)
+    assert not t.stores
+    t.not_full()
     t.poll(550)
-    assert t.stores == words + [0xfeed]
+    assert t.stores == [(0, w) for w in words] + [(1, 0xfeed)]
     assert len(t.fetches) == 4 and not t.kicks and not t.notifications
-    t.vp_done(); t.poll()
-    assert t.kicks == [0x2b000400] and not t.notifications
-    t.vp_done(); t.poll()
+    start = 0x100 if t.version == 2 else 0x200
+    mask = t.info[10]
+    # VP1 finishes first. Context20 completion bypasses context10.
+    t.vp_done(1); t.poll()
+    assert t.kicks == [0x2b000010 | start | mask]
+    t.vp_done(0); t.poll()
     assert len(t.kicks) == 1
     t.pp_done(); t.poll()
-    assert t.result(0) == [2, 0, 0xabcd0000]
-    assert t.notifications == [0x54530000]
-    assert t.kicks == [0x2b000400, 0x2b000410]
-    t.pp_done(); t.poll(5)
-    assert t.result(1)[0] == 1 and len(t.notifications) == 1
-    t.busy = False; t.poll()
     assert t.result(1) == [2, 0, 0x12340001]
-    assert t.notifications == [0x54530000, 0x54530001]
-    # Exercise slot reuse with a different full generation and max u32 tag.
-    t.busy = False
-    t.submit(15, 0xffffffff, [123])
-    t.poll(8); t.vp_done(); t.poll(); t.pp_done(); t.poll()
-    assert t.result(15) == [2, 0, 0xffffffff]
-    assert t.notifications[-1] == 0x5453ffff
-    # Decode error halts all accepted work; late events cannot kick PP.
+    assert t.notifications == [0x54530001]
+    assert t.kicks[1:] == [0x2b000000 | start | mask, 0x2b000000 | mask, 0x2b000000 | mask]
+    t.pp_done(); t.poll(5)
+    assert t.result(0)[0] == 1 and len(t.notifications) == 1
+    t.busy = False; t.poll()
+    assert t.result(0) == [2, 0, 0xabcd0000]
+    assert t.notifications[-1] == 0x54530000
+    # Same-context predecessor must finish PP before the next VP starts.
     t = Transport(image)
-    t.submit(0, 0x20000, [1]); t.submit(1, 0x20001, [2]); t.poll(20)
-    t.call("irq19" if t.version == 2 else "irq79")
+    t.submit(0, 0x20000, [1], context=10)
+    t.submit(1, 0x20001, [2], context=10, dep=1)
+    t.submit(2, 0x20002, [3], context=20, dep=1)
+    t.poll(30)
+    assert t.stores == [(0, 1), (1, 3)]
+    t.vp_done(0); t.poll()
+    assert len(t.stores) == 2
+    t.pp_done(); t.poll(12)
+    assert t.stores[-1][1] == 2
+    # Out-of-order completion within a context still publishes ordered tags.
+    t = Transport(image)
+    t.submit(0, 0x30000, [1], context=10)
+    t.submit(1, 0x30001, [2], context=10)
+    t.poll(20); t.vp_done(1); t.poll(); t.pp_done(); t.poll()
+    assert not t.notifications
+    t.vp_done(0); t.poll(); t.pp_done(); t.poll()
+    assert t.result(0) == [2, 0, 0x30000]
+    t.busy = False; t.poll()
+    assert t.result(1) == [2, 0, 0x30001]
+    # Reject indices outside the independent FIFO budget without DMA stores.
+    t = Transport(image)
+    t.submit(t.info[10], 0x40000 | t.info[10], [1]); t.poll(8)
+    assert not t.stores and not t.fetches
+    assert t.result(t.info[10]) == [2, 1, 0x40000 | t.info[10]]
+    # Decode errors halt all accepted work; late events cannot kick PP.
+    t = Transport(image)
+    t.submit(0, 0x50000, [1]); t.submit(1, 0x50001, [2]); t.poll(20)
+    t.call("irq19" if t.version <= 3 else "irq79")
     t.poll(); t.busy = False; t.poll()
-    assert t.result(0) == [2, 2, 0x20000] and t.result(1) == [2, 2, 0x20001]
+    assert t.result(0) == [2, 2, 0x50000] and t.result(1) == [2, 2, 0x50001]
     t.vp_done(); t.poll()
     assert not t.kicks
-    # A duplicate doorbell must not replace an in-flight tag; it poisons the
-    # queue and emits the separate fatal token after accepted errors drain.
+    # Duplicate doorbells preserve the tag and emit a separate fatal token.
     t = Transport(image)
-    t.submit(0, 0x20000, [1]); t.poll(8)
-    t.put(0x50010058, t.ring); t.call("irq1")
-    t.poll(2)
-    assert t.result(0) == [2, 2, 0x20000]
+    t.submit(0, 0x60000, [1]); t.poll(8)
+    t.put(0x50010058, t.ring); t.call("irq1"); t.poll(2)
+    assert t.result(0) == [2, 2, 0x60000]
     t.busy = False; t.poll()
     assert t.notifications[-1] == 0x5452ffff
-    # Explicit init is also sufficient after dirty SRAM (boot/reset path).
+    # Dirty SRAM reset plus 64-bit program IOVA and a high generation tag.
     t.call("avdq_fw_init")
     t.busy = False; t.notifications.clear()
-    t.submit(0, 0x30000, [3]); t.poll(8)
+    t.submit(0, 0xfffffff0, [3]); t.poll(8)
     t.vp_done(); t.poll(); t.pp_done(); t.poll()
-    assert t.result(0) == [2, 0, 0x30000]
-    print(image.stem + ": legacy IRQs, 64-bit PIODMA, packets, FIFO pressure, VP->PP, outbox, tags, error/reset passed", flush=True)
+    assert t.result(0) == [2, 0, 0xfffffff0]
+    print(image.stem + ": concurrent VP0/VP1 contexts, FIFO cap, dependencies, ordered tags, PP continuations, FULL IRQ, error/reset passed", flush=True)
 
 
 if __name__ == "__main__":

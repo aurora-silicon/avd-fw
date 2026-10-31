@@ -1,50 +1,52 @@
 /* SPDX-License-Identifier: MIT */
 #include "queue.h"
 
-void avdq_init(struct avdq *q)
+void avdq_init(struct avdq *q, const struct avdq_variant *variant)
 {
 	unsigned int i;
-	q->head = q->count = q->halted = 0;
+	q->count = q->halted = 0;
 	q->pp_active = -1;
+	q->variant = variant;
+	for (i = 0; i < 4; i++)
+		q->next_vp[i] = 0;
 	for (i = 0; i < AVDQ_COUNT; i++)
 		q->frame[i].phase = AVDQ_FREE;
 }
 
-static int valid(const struct avdq_desc *d, unsigned int idx,
-		 unsigned int vp_count, unsigned int codec_mask)
+static int valid(const struct avdq *q, const struct avdq_desc *d, unsigned int idx)
 {
 	uint64_t addr = ((uint64_t)d->program_hi << 32) | d->program_lo;
-	uint64_t packets = (d->program_words + AVDQ_PACKET_WORDS - 1u) /
+	uint64_t packets = ((uint64_t)d->program_words + AVDQ_PACKET_WORDS - 1u) /
 			   AVDQ_PACKET_WORDS;
-	unsigned int i;
+	uint64_t fifo = ((uint64_t)d->fifo_hi << 32) | d->fifo_lo;
 	if (d->magic != AVDQ_MAGIC || (d->tag & 15u) != idx ||
 	    d->state != AVDQ_SUBMITTED || d->codec > AVDQ_AV1 ||
-	    !(codec_mask & (1u << d->codec)) || d->vp_slot >= vp_count ||
-	    !addr || (addr & 3u) || !d->program_words ||
-	    d->program_words > AVDQ_MAX_WORDS ||
-	    addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES || !d->pp_kick)
+	    !q->variant->count[d->codec] || d->fifo != idx ||
+	    idx >= q->variant->fifo_slots || !addr || (addr & 3u) ||
+	    !d->program_words || d->program_words > AVDQ_MAX_WORDS ||
+	    addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES ||
+	    !d->num_segments || d->num_segments > d->program_words ||
+	    d->dependency > AVDQ_DEP_PREV_DONE ||
+	    !fifo || (fifo & 255u) || (q->variant->lsr && fifo >= (1ull << 38)))
 		return 0;
-	for (i = 0; i < 5; i++)
-		if (d->reserved[i])
-			return 0;
+	if (d->reserved)
+		return 0;
 	return 1;
 }
 
-int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d,
-	       unsigned int vp_count, unsigned int codec_mask)
+int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d)
 {
 	struct avdq_frame *f;
-	/* Duplicate doorbells must never overwrite the owner or its full tag. */
 	if (idx >= AVDQ_COUNT || q->count == AVDQ_COUNT ||
 	    q->frame[idx].phase != AVDQ_FREE || q->halted)
 		return -1;
 	f = &q->frame[idx];
 	f->desc = *d;
 	f->pushed = 0;
-	f->status = valid(d, idx, vp_count, codec_mask) ? AVDQ_OK : AVDQ_INVALID;
+	f->vp = AVDQ_VPS;
+	f->status = valid(q, d, idx) ? AVDQ_OK : AVDQ_INVALID;
 	f->phase = f->status ? AVDQ_DONE : AVDQ_PENDING;
-	q->order[(q->head + q->count) & (AVDQ_COUNT - 1)] = idx;
-	q->count++;
+	q->order[q->count++] = idx;
 	return 0;
 }
 
@@ -68,13 +70,12 @@ void avdq_vp_done(struct avdq *q, unsigned int vp)
 	if (q->halted)
 		return;
 	for (i = 0; i < q->count; i++) {
-		struct avdq_frame *f = &q->frame[q->order[(q->head + i) & 15u]];
-		if (f->phase == AVDQ_VP && f->desc.vp_slot == vp) {
+		struct avdq_frame *f = &q->frame[q->order[i]];
+		if (f->phase == AVDQ_VP && f->vp == vp) {
 			f->phase = AVDQ_PP_READY;
 			return;
 		}
 	}
-	/* Lost/coalesced or premature DONE cannot be attributed safely. */
 	avdq_fault(q);
 }
 
@@ -90,43 +91,96 @@ void avdq_pp_done(struct avdq *q)
 	q->pp_active = -1;
 }
 
-void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
+static int predecessor(const struct avdq *q, unsigned int pos, int unfinished)
 {
 	unsigned int i;
-	/* Publish in submission order; a full outbox never drops a completion. */
-	if (q->count) {
-		unsigned int idx = q->order[q->head];
+	const struct avdq_frame *f = &q->frame[q->order[pos]];
+	for (i = 0; i < pos; i++) {
+		const struct avdq_frame *p = &q->frame[q->order[i]];
+		if (p->desc.context == f->desc.context &&
+		    (!unfinished || p->phase != AVDQ_DONE))
+			return 1;
+	}
+	return 0;
+}
+
+static int free_vp(struct avdq *q, unsigned int codec)
+{
+	unsigned int i, j, count = q->variant->count[codec];
+	for (i = 0; i < count; i++) {
+		unsigned int off = (q->next_vp[codec] + i) % count;
+		unsigned int vp = q->variant->base[codec] + off;
+		for (j = 0; j < q->count; j++) {
+			struct avdq_frame *f = &q->frame[q->order[j]];
+			if ((f->phase == AVDQ_PUSH || f->phase == AVDQ_VP) && f->vp == vp)
+				break;
+		}
+		if (j == q->count) {
+			q->next_vp[codec] = (off + 1) % count;
+			return (int)vp;
+		}
+	}
+	return -1;
+}
+
+void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
+{
+	unsigned int i, j;
+	/* Separate contexts do not block each other's ordered completion stream. */
+	for (i = 0; i < q->count; i++) {
+		unsigned int idx = q->order[i];
 		struct avdq_frame *f = &q->frame[idx];
-		if (f->phase == AVDQ_DONE && ops->complete(cookie, idx, f)) {
+		if (f->phase == AVDQ_DONE && !predecessor(q, i, 0) &&
+		    ops->complete(cookie, idx, f)) {
 			f->phase = AVDQ_FREE;
-			q->head = (q->head + 1u) & 15u;
+			for (j = i + 1; j < q->count; j++)
+				q->order[j - 1] = q->order[j];
 			q->count--;
+			break;
 		}
 	}
 	if (q->halted)
 		return;
-	for (i = 0; i < q->count; i++) {
-		unsigned int idx = q->order[(q->head + i) & 15u];
+	for (i = 0; i < q->count && q->pp_active < 0; i++) {
+		unsigned int idx = q->order[i];
 		struct avdq_frame *f = &q->frame[idx];
-		if (f->phase == AVDQ_PP_READY && q->pp_active < 0) {
-			q->pp_active = (int)idx;
-			f->phase = AVDQ_PP;
-			ops->kick(cookie, f->desc.pp_kick);
+		uint32_t word;
+		if (f->phase != AVDQ_PP_READY)
+			continue;
+		q->pp_active = (int)idx;
+		f->phase = AVDQ_PP;
+		word = AVDQ_EXEC | (f->desc.fifo << 4) | q->variant->fifo_mask;
+		if (f->desc.codec == AVDQ_VP9 && q->variant->exec_start == 8)
+			word |= 0xfff000u;
+		ops->kick(cookie, word | (1u << q->variant->exec_start));
+		for (j = 1; j < f->desc.num_segments; j++)
+			ops->kick(cookie, word);
+	}
+	/* A single PIODMA staging buffer must stay with its partially fed frame. */
+	for (i = 0; i < q->count; i++)
+		if (q->frame[q->order[i]].phase == AVDQ_PUSH)
+			break;
+	if (i == q->count) {
+		for (i = 0; i < q->count; i++) {
+			struct avdq_frame *f = &q->frame[q->order[i]];
+			int vp;
+			if (f->phase != AVDQ_PENDING ||
+			    (f->desc.dependency == AVDQ_DEP_PREV_DONE && predecessor(q, i, 1)))
+				continue;
+			vp = free_vp(q, f->desc.codec);
+			if (vp < 0)
+				continue;
+			f->vp = (unsigned int)vp;
+			f->phase = AVDQ_PUSH;
 			break;
 		}
 	}
-	/* One SRAM staging buffer; preserve program order across chunks. */
-	for (i = 0; i < q->count; i++) {
-		struct avdq_frame *f = &q->frame[q->order[(q->head + i) & 15u]];
-		int result;
-		if (f->phase != AVDQ_PENDING && f->phase != AVDQ_PUSH)
-			continue;
-		f->phase = AVDQ_PUSH;
-		result = ops->feed(cookie, f);
+	if (i < q->count) {
+		struct avdq_frame *f = &q->frame[q->order[i]];
+		int result = ops->feed(cookie, f);
 		if (result < 0)
 			avdq_fault(q);
 		else if (result > 0)
 			f->phase = AVDQ_VP;
-		break;
 	}
 }

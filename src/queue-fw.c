@@ -61,7 +61,8 @@ struct queue_fw {
 	struct avdq q;
 	volatile unsigned int mode, fatal, in_write, in_read;
 	volatile unsigned int inbox[AVDQ_COUNT];
-	volatile unsigned int vp_done[12], pp_done, error;
+	volatile unsigned int vp_done[12], pp_done, error, vp_ready;
+	unsigned int fifo_wait, runnable;
 	unsigned int dma_pending, dma_wait, stage_words, stage_used;
 };
 #define FW ((struct queue_fw *)(SRAM_ALIAS + 0x6000u))
@@ -78,7 +79,7 @@ void avdq_fw_init(void)
 	volatile unsigned int *p = (volatile unsigned int *)FW;
 	for (i = 0; i < sizeof(*FW) / sizeof(*p); i++)
 		p[i] = 0;
-	avdq_init(&FW->q);
+	avdq_init(&FW->q, AVDQ_IMAGE_VARIANT);
 	for (i = 0; i < 16; i++)
 		Q_INFO[i] = 0;
 	Q_INFO[1] = AVDQ_VERSION;
@@ -91,6 +92,9 @@ void avdq_fw_init(void)
 	Q_INFO[8] = VP_COUNT;
 	Q_INFO[9] = AVD_VER <= 3 ? 7u : 15u;
 	Q_INFO[10] = FIFO_SLOTS;
+	for (i = 0; i < 4; i++)
+		Q_INFO[11 + i] = AVDQ_IMAGE_VARIANT->base[i] |
+			(AVDQ_IMAGE_VARIANT->count[i] << 8);
 	barrier();
 	Q_INFO[0] = AVDQ_MAGIC;
 }
@@ -118,8 +122,11 @@ int avdq_fw_event(unsigned int vp, unsigned int event)
 {
 	if (!FW->mode)
 		return 0;
-	if (event == DECODE_STATUS_FULL)
+	if (event == DECODE_STATUS_FULL) {
+		if (vp < VP_COUNT)
+			FW->vp_ready |= 1u << vp;
 		return 1;
+	}
 	if (event == DECODE_STATUS_ERR)
 		FW->error = 1;
 	else if (vp == IRQ_SUBMIT)
@@ -131,13 +138,78 @@ int avdq_fw_event(unsigned int vp, unsigned int event)
 	return 1;
 }
 
+void avdq_fw_full_mask(unsigned int vp, unsigned int enable)
+{
+#if AVD_VER == 2
+	u32 *mask = REG(DECODE_CTRL_BASE + 0x405c);
+	u32 bit = DECODE_STATUS_FULL << (vp * 5);
+#elif AVD_VER == 3
+	u32 *mask = REG(DECODE_CTRL_BASE + 0xfc + vp * 4);
+	u32 bit = DECODE_STATUS_FULL;
+#else
+	u32 *mask = REG(DECODE_CTRL_BASE + 0x15c + vp * 4);
+	u32 bit = DECODE_STATUS_FULL;
+#endif
+	reg_write(mask, enable ? reg_read(mask) | bit : reg_read(mask) & ~bit);
+}
+
+static void configure_fifo(const struct avdq_frame *f)
+{
+	u32 fifo = f->desc.fifo * 4u;
+	uint64_t addr = ((uint64_t)f->desc.fifo_hi << 32) | f->desc.fifo_lo;
+#if AVD_VER == 2
+	reg_write(REG(DECODE_CTRL_BASE + 0x4068 + fifo), (u32)(addr >> 8));
+	reg_write(REG(DECODE_CTRL_BASE + 0x4084 + fifo), 0);
+	reg_write(REG(DECODE_CTRL_BASE + 0x40a0 + fifo), 0);
+	reg_write(REG(DECODE_CTRL_BASE + 0x40bc + fifo), 0);
+	reg_write(REG(DECODE_CTRL_BASE + 0x4040 + f->vp * 4), 0);
+	u32 *mask = REG(DECODE_CTRL_BASE + 0x405c);
+	reg_write(mask, reg_read(mask) | (7u << (f->vp * 5)) | (5u << 20));
+#else
+#if AVD_VER == 3
+	const u32 lo = 0x150, hi = 0x30c, mask = 0x18c, cach = 0x1c8, xfer = 0x204;
+	const u32 vp_irq = 0xfc, pp_irq = 0x120;
+#else
+	const u32 lo = 0x1d0, hi = 0x20c, mask = 0x248, cach = 0x284, xfer = 0x2c0;
+	const u32 vp_irq = 0x15c, pp_irq = 0x190;
+#endif
+	if (AVDQ_IMAGE_VARIANT->lsr)
+		reg_write(REG(DECODE_CTRL_BASE + lo + fifo), (u32)(addr >> 8));
+	else {
+		reg_write(REG(DECODE_CTRL_BASE + hi + fifo), (u32)(addr >> 32));
+		reg_write(REG(DECODE_CTRL_BASE + lo + fifo), (u32)addr);
+	}
+	reg_write(REG(DECODE_CTRL_BASE + mask + fifo), 0);
+	reg_write(REG(DECODE_CTRL_BASE + cach + fifo), 0);
+	reg_write(REG(DECODE_CTRL_BASE + xfer + fifo), 0);
+	u32 *vp_mask = REG(DECODE_CTRL_BASE + vp_irq + f->vp * 4);
+	u32 *pp_mask = REG(DECODE_CTRL_BASE + pp_irq);
+	reg_write(vp_mask, reg_read(vp_mask) | 7u);
+	reg_write(pp_mask, reg_read(pp_mask) | 5u);
+#endif
+}
+
 static int feed(void *cookie, struct avdq_frame *f)
 {
 	struct queue_fw *fw = cookie;
 	unsigned int words, max, cur;
+	unsigned int bit = 1u << f->vp;
 	uint64_t addr;
+	/* FULL is a not-full notification. No occupancy reads while asleep. */
+	if (fw->fifo_wait & bit) {
+		__asm volatile("cpsid i" ::: "memory");
+		if (!(fw->vp_ready & bit)) {
+			__asm volatile("cpsie i" ::: "memory");
+			return 0;
+		}
+		fw->vp_ready &= ~bit;
+		fw->fifo_wait &= ~bit;
+		__asm volatile("cpsie i" ::: "memory");
+	}
 	if (fw->stage_used == fw->stage_words) {
 		if (!fw->dma_pending) {
+			if (!f->pushed)
+				configure_fifo(f);
 			words = f->desc.program_words - f->pushed;
 			if (words > AVDQ_PACKET_WORDS)
 				words = AVDQ_PACKET_WORDS;
@@ -148,12 +220,15 @@ static int feed(void *cookie, struct avdq_frame *f)
 			reg_write(Q_DMA(0x50), (unsigned int)(addr >> 32));
 			barrier();
 			reg_write(Q_DMA(0x54), avdq_dma_command(words));
+			fw->runnable = 1;
 			fw->dma_pending = 1;
 			fw->dma_wait = 1000000;
 			return 0;
 		}
-		if (!(reg_read(Q_DMA(0x04)) & 1u))
+		if (!(reg_read(Q_DMA(0x04)) & 1u)) {
+			fw->runnable = 1;
 			return --fw->dma_wait ? 0 : -1;
+		}
 		reg_write(Q_DMA(0x04), 1);
 		barrier();
 		fw->stage_words = f->desc.program_words - f->pushed;
@@ -162,14 +237,30 @@ static int feed(void *cookie, struct avdq_frame *f)
 		fw->stage_used = fw->dma_pending = 0;
 	}
 	/* Same per-VP capacity/occupancy registers as Linux's direct FIFO path. */
-	max = reg_read(REG(DECODE_CTRL_BASE + FIFO_MAX + f->desc.vp_slot * 4u));
-	cur = reg_read(REG(DECODE_CTRL_BASE + FIFO_CUR + f->desc.vp_slot * 4u));
-	if (!max || cur >= max)
-		return 0; /* Poll later; interrupts/PP/completions continue progressing. */
-	reg_write(REG(DECODE_CTRL_BASE + VP_FIFO + f->desc.vp_slot * 4u),
+	max = reg_read(REG(DECODE_CTRL_BASE + FIFO_MAX + f->vp * 4u));
+	cur = reg_read(REG(DECODE_CTRL_BASE + FIFO_CUR + f->vp * 4u));
+	if (!max)
+		return -1;
+	if (cur >= max) {
+		/* Arm then recheck to close the drain-before-unmask race. */
+		__asm volatile("cpsid i" ::: "memory");
+		fw->vp_ready &= ~bit;
+		fw->fifo_wait |= bit;
+		avdq_fw_full_mask(f->vp, 1);
+		cur = reg_read(REG(DECODE_CTRL_BASE + FIFO_CUR + f->vp * 4u));
+		if (cur < max) {
+			avdq_fw_full_mask(f->vp, 0);
+			fw->fifo_wait &= ~bit;
+			fw->runnable = 1;
+		}
+		__asm volatile("cpsie i" ::: "memory");
+		return 0;
+	}
+	reg_write(REG(DECODE_CTRL_BASE + VP_FIFO + f->vp * 4u),
 		  Q_STAGE[fw->stage_used++]);
 	/* Conservative local store cadence also used by the Tansy HEVC path. */
 	__asm volatile("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop" ::: "memory");
+	fw->runnable = 1;
 	f->pushed++;
 	if (f->pushed == f->desc.program_words) {
 		fw->stage_words = fw->stage_used = 0;
@@ -180,14 +271,14 @@ static int feed(void *cookie, struct avdq_frame *f)
 
 static void kick(void *cookie, uint32_t word)
 {
-	(void)cookie;
+	((struct queue_fw *)cookie)->runnable = 1;
 	reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), word);
 }
 
 static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
 {
 	volatile struct avdq_desc *d = Q_DESC(idx);
-	(void)cookie;
+	((struct queue_fw *)cookie)->runnable = 1;
 	if (!(reg_read(CM3_MBOX1_STATUS) & CM3_MBOX1_EMPTY))
 		return 0;
 	d->status = f->status;
@@ -203,6 +294,7 @@ int avdq_fw_poll(void)
 {
 	static const struct avdq_ops ops = { feed, kick, complete };
 	unsigned int i, vp_done[12], pp_done, error;
+	FW->runnable = 0;
 	if (!FW->mode)
 		return 0;
 	/* IRQ handlers latch only events; all scheduler mutations are foreground. */
@@ -232,7 +324,8 @@ int avdq_fw_poll(void)
 		for (i = 0; i < AVDQ_DESC_BYTES / 4; i++)
 			dst[i] = src[i];
 		FW->in_read++;
-		if (avdq_submit(&FW->q, idx, &d, VP_COUNT, AVD_VER <= 3 ? 7u : 15u)) {
+		FW->runnable = 1;
+		if (avdq_submit(&FW->q, idx, &d)) {
 			FW->fatal = 1;
 			avdq_fault(&FW->q);
 		}
@@ -245,14 +338,17 @@ int avdq_fw_poll(void)
 		reg_write(CM3_MBOX1_TX, AVDQ_FATAL);
 		FW->fatal = 0;
 	}
-	return 1;
+	return FW->runnable;
 }
 
 void avdq_fw_idle(void)
 {
-	/* A masked pending IRQ wakes WFI; enable it only after the mode check. */
+	/* Check latched events with IRQs masked to close the idle-entry race. */
 	__asm volatile("cpsid i" ::: "memory");
-	if (!FW->mode)
+	unsigned int events = FW->error | FW->pp_done | FW->vp_ready;
+	for (unsigned int i = 0; i < VP_COUNT; i++)
+		events |= FW->vp_done[i];
+	if (!events && FW->in_read == FW->in_write && !FW->fatal)
 		__asm volatile("dsb sy\n\twfi" ::: "memory");
 	__asm volatile("cpsie i" ::: "memory");
 }

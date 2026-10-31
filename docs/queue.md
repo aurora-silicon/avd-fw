@@ -1,290 +1,204 @@
-# Open firmware frame queue, ABI 1
+# Open firmware queue ABI 2
 
-This is the MIT open backend protocol, not an Apple firmware ABI. All words are
-little endian. It preserves legacy `0x100 | vp` / `0x1000` interrupt messages
-until the first queue descriptor doorbell after boot. The v5 Tansy diagnostic
-mailbox commands also remain available in legacy mode. Never mix the two modes;
-a hardware reset and firmware boot are required to switch back to legacy mode.
-No Apple firmware image, extracted table, or captured payload is needed.
+This MIT protocol carries host-generated VP instruction programs to the CM3.
+Firmware selects the VP, configures the frame's hardware FIFO, chains VP to PP,
+and publishes tagged completions. It is separate from the Apple firmware ABI.
+Firmware retains the legacy interrupt protocol until its first queue doorbell.
+A hardware reset and firmware boot are required to leave queue mode.
 
-## Memory and discovery
+ABI 2 intentionally rejects ABI 1 descriptors. Both endpoints must be updated.
+The version is published before the boot-ready flag. There is no negotiation
+that silently interprets one descriptor layout as the other.
 
-The host maps the DT `sram` resource (the command aperture). CM3 sees its byte
-zero at `0x10000000`. Offsets below are relative to that resource, **not** to the
-`code`, `ctrl`, or mailbox resource. Firmware publishes this read-only 64-byte
-information block at SRAM `+0x7fc0` before raising the existing boot-ready flag:
+## Images and pools
 
-| Offset | u32 value |
+| Image | HEVC VP indices | H.264 | VP9 | AV1 | FIFO slots/mask | LSR addresses |
+| --- | --- | --- | --- | --- | --- | --- |
+| v2-t0 | 0..1 | 2 | 3 | none | 7 | yes |
+| v3-t0 | 0..3 | 4..7 | 8 | none | 15 | yes |
+| v3-t1 | 0..3 | 4..7 | 8 | none | 15 | yes |
+| v3-t2 | 0..3 | 4..7 | 8 | none | 15 | no |
+| v4-t0 | 0..3 | 4..7 | 8 | 9..10 | 15 | no |
+| v5-t0 | 0..1 | 4 | 8 | 9 | 7 | no |
+| v5-t1 | 0..3 | 4..7 | 8 | 9..11 | 15 | no |
+| v5-t2 | 0..3 | 4..7 | 8 | 9..11 | 15 | no |
+
+The v5-t2 engine counts are inferred from the full-size family and require
+silicon validation. The v3-t2 image selects the existing v3t1 tunables used for
+T6020, with non-LSR FIFO addresses. There is no separate public v3t2 tuning
+array. Both Make and Meson build all eight images, including v5t2 tunables.
+
+## Discovery
+
+All wire words are little endian. The host reads sixteen u32 words from the DT
+SRAM resource at offset `0x7fc0` after boot-ready:
+
+| Word | Value |
 | --- | --- |
-| 0x00 | magic `0x41565131` (`AVQ1`), published last |
-| 0x04 | ABI version, 1 |
-| 0x08 | descriptor count, 16 |
-| 0x0c | descriptor stride, 64 |
-| 0x10 | SRAM aperture address in the four-byte doorbell address space |
-| 0x14 | descriptor ring offset, `0x8000` |
-| 0x18 | maximum payload words per program packet, 256 |
-| 0x1c | PIODMA destination header for every packet (use verbatim) |
-| 0x20 | VP register index limit (exclusive), 4 / 9 / 12 |
-| 0x24 | codec mask: bits HEVC=0, H.264=1, VP9=2, AV1=3 |
-| 0x28 | hardware FIFO slots: cap frames in flight at min(16, this) |
-| 0x2c..0x3c | reserved, zero |
+| 0 | magic `0x41565131`, published last |
+| 1 | ABI version 2 |
+| 2, 3 | descriptor count 16, stride 64 bytes |
+| 4 | SRAM aperture address in the doorbell address space |
+| 5, 6 | ring offset `0x8000`, packet payload size 256 words |
+| 7 | PIODMA destination header, use verbatim |
+| 8, 9 | VP register index limit, supported codec mask |
+| 10 | independent FIFO slots, 7 or 15 |
+| 11..14 | one codec pool each: base index in bits 7:0, count in bits 15:8 |
+| 15 | reserved, zero |
 
-Read the block after boot-ready. Missing magic means old firmware: use the
-legacy backend, or reject queue mode. An unknown version must not be submitted.
-Check count/stride/packet size and the actual SRAM resource length. Use the
-advertised address instead of deriving it from the host physical address.
+Codecs are HEVC=0, H.264=1, VP9=2, AV1=3. The VP limit is an address bound,
+not an engine count: tier 0 has holes. Host match data and advertised pool
+geometry must agree. Absent magic allows legacy operation; an unknown ABI
+version must never be submitted.
 
-The ring occupies `+0x8000..+0x83ff`. Firmware private state is at
-`+0x6000..+0x7fbf`, and its 1024-byte PIODMA staging buffer is at `+0x9000`.
-The minimum SRAM size supported by the existing images is `0xc000`. The stack
-stays at the existing per-image SRAM end. Do not use these regions for codec
-scratch or legacy commands in queue mode.
+CM3 sees SRAM byte zero at `0x10000000`. Private queue state occupies
+`+0x6000..+0x7fbf`, descriptors `+0x8000..+0x83ff`, and the single staging
+buffer `+0x9000..+0x93ff`. The smallest supported SRAM is `0xc000` bytes.
+The host must not use these regions for scratch or legacy commands.
 
-Current firmware aperture addresses are:
+| Image | Doorbell SRAM aperture | PIODMA base |
+| --- | --- | --- |
+| v2-t0 | `0x0108c000` | `0x40070000` |
+| v3-t0/t1/t2 | `0x01090000` | `0x40070000` |
+| v4-t0 | `0x01092000` | `0x41070000` |
+| v5-t0 | `0x01090000` | `0x41070000` |
+| v5-t1 | `0x01092000` | `0x41070000` |
+| v5-t2 | `0x01094000` | `0x41070000` |
 
-| Image | SRAM address | PIODMA CM3 base | VP FIFO / PP FIFO offset from decode base |
-| --- | --- | --- | --- |
-| v2-t0 | `0x0108c000` | `0x40070000` | `0x4004 + 4*vp` / `0x4014` |
-| v3-t0, v3-t1 | `0x01090000` | `0x40070000` | `0x000c + 4*vp` / `0x0030` |
-| v4-t0 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
-| v5-t0 | `0x01090000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
-| v5-t1 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
-| v5-t2 (T6040/T6041) | `0x01094000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
-
-The aperture must match the SoC's DT `sram` offset from the AVD base
-(+0x90000 on T6000, T8112 and T8140; +0x92000 on T8132; +0x94000 on T6040),
-because the PIODMA destination header is an address in that space. T6040 must
-load `avd-fw-v5-t2` for queue mode: `avd-fw-v5-t1` would place staged words
-0x2000 bytes low, inside the firmware's private state. Legacy mode does not
-use the aperture, so T6040 legacy decode is unaffected by the image choice.
-
-Firmware image version numbers differ from Linux's hardware revision numbering:
-T8103 uses v2, T6000/T8112 use v3, T8122 uses v4, and T8140/T6040 use v5.
-The host must select the correct tier and existing match-data VP/codec mapping;
-the VP limit is an address bound, not permission to use absent codec slots.
+The aperture must match the DT SRAM window. T6040 uses v5-t2; using v5-t1
+would stage DMA data into the wrong SRAM region. The host writes the physical
+SRAM base shifted right four to its PIODMA resource `+0x24` before CM3 boot.
+Both decode and PIODMA DART stream IDs must be attached to its DMA domain.
 
 ## Descriptor and ownership
 
-Each descriptor is exactly 16 u32 words (`struct avdq_desc` in `src/queue.h`):
+Each descriptor is 64 bytes (`src/queue.h`):
 
-| Offset | Field | Owner / meaning |
+| Offset | Field | Meaning |
 | --- | --- | --- |
-| 0x00 | magic | host: `0x41565131` |
-| 0x04 | tag | host: full u32 `(sequence << 4) | ring_index` |
-| 0x08 | codec | host: HEVC=0, H.264=1, VP9=2, AV1=3 |
-| 0x0c | vp_slot | host: hardware VP index from SoC codec match data |
-| 0x10 | program_lo | host: low 32 bits of packet-buffer PIODMA IOVA |
-| 0x14 | program_hi | host: high 32 bits of that IOVA |
-| 0x18 | program_words | host: instruction words, excludes packet headers/padding |
-| 0x1c | pp_kick | host: exact single PP FIFO execution command |
-| 0x20 | state | host publishes 1 (SUBMITTED); firmware publishes 2 (COMPLETE) |
-| 0x24 | status | firmware: 0 success, 1 invalid descriptor, 2 fatal pipeline I/O |
-| 0x28 | completion_tag | firmware: full unmodified 32-bit submitted tag |
-| 0x2c..0x3c | reserved[5] | host: zero |
+| 0x00 | magic | `0x41565131` |
+| 0x04 | tag | full u32, low nibble equals ring index |
+| 0x08 | codec | 0..3 |
+| 0x0c | fifo | must equal ring index and be less than FIFO slots |
+| 0x10, 0x14 | program_lo/hi | packet buffer DMA address |
+| 0x18 | program_words | payload words, 1..0x100000 |
+| 0x1c | num_segments | PP EXEC count, 1..program_words |
+| 0x20 | state | host publishes 1, firmware publishes 2 |
+| 0x24 | status | firmware: 0 success, 1 invalid, 2 fatal I/O |
+| 0x28 | completion_tag | full submitted tag, unmodified |
+| 0x2c | context | opaque context identity, unique among live clients |
+| 0x30 | dependency | 0 independent, 1 previous context work DONE |
+| 0x34, 0x38 | fifo_lo/hi | distinct frame-owned instruction FIFO DMA address |
+| 0x3c | reserved | zero |
 
-The host can choose any free index; doorbell arrival defines submission order.
-There is no shared producer counter or sentinel entry: all 16 entries can be
-owned by firmware. Firmware maintains a bounded internal FIFO of descriptor
-indices and copies each descriptor before processing. The host must not modify
-an entry or its program/scratch mappings from its doorbell until consuming its
-completion notification. Do not poll state=COMPLETE as permission to reuse the
-entry: the mailbox word may still be pending. Keep a saved full tag per index.
+Only indices `0..fifo_slots-1` may execute. The sentinel ring entry is not an
+extra hardware FIFO: the maximum is 7 or 15, never 8 or 16. Firmware validates
+index equality to prevent aliasing. FIFO memory is 256-byte aligned and remains
+owned until notification consumption. LSR images require an address below 38 bits.
+The host sizes each FIFO allocation for the instruction stream (Linux uses the
+existing 12-MiB FIFO allocation), and supplies its IOVA in the decode DMA domain.
 
-The host allocates distinct hardware instruction/FIFO storage for every frame
-that may overlap, configures its FIFO IOVA/cache/xfer and VP/PP IRQ masks using
-existing SoC match data **before** publishing, and embeds that FIFO index in its
-VP instructions and PP command. Those mappings live through PP completion.
-The effective in-flight limit is the minimum of 16 and the SoC's available
-independent FIFO/context storage. Do not overwrite another live frame's FIFO
-registers. Codec dependency barriers (VP9 probability updates, AV1 CDF updates,
-references, etc.) remain host responsibilities. A codec needing several PP
-commands must combine/split its work into supported one-kick submissions; ABI 1
-does not represent a multi-kick PP program.
+Doorbell arrival defines submission order. The host retains descriptors, packet
+buffers and FIFO mappings unchanged until it consumes the matching completion.
+Publishing state=2 alone does not release ownership; the notification can still
+be pending. No tag/index can be recycled while an old notification remains.
 
-Submission sequence:
+Every VP EXEC in the supplied program must already contain the descriptor's
+FIFO index. Firmware copies VP programs unchanged, including start, continuation
+and final END words. It does not scan arbitrary operands for opcode patterns.
+The host writes/synchronizes the packet buffer, writes the complete descriptor
+through SRAM I/O accessors, issues a write barrier and state readback, then
+writes exactly `info[4] + 0x8000 + 64 * index` to AP mailbox 0 TX (`+0x54`).
+Check mailbox 0 EMPTY first; a busy inbox owns nothing and is retried later.
 
-1. Reserve an unused ring index and full tag; construct the complete VP program,
-   including the existing start/continuation/final END words. Firmware copies
-   these words unchanged; it does not infer codec instructions or insert END.
-2. Prepare and DMA-sync the packet buffer in the **PIODMA** address space. This
-   is the mapper for PIODMA source fetches (mapper 1 where separate); it is not
-   automatically the VP's instruction/data mapper. The host must arrange the
-   appropriate DART mappings, including on platforms whose current DT only
-   exposes the primary mapping. An arbitrary CPU pointer is never an IOVA.
-3. Write the descriptor with status/completion_tag/reserved zero and state=1.
-   Use `memcpy_toio`/`writel` for the SRAM aperture and the proper DMA ownership
-   operations for the packet buffer. Issue `wmb()` and read back the descriptor
-   state to flush posted aperture writes before ringing the mailbox.
-4. Wait for mailbox 0's TX-full condition to clear (nonblocking `-EBUSY` is fine).
-   Write exactly one u32: `info.sram_address + 0x8000 + 64 * index`, through the
-   existing AP-to-CM3 mailbox. Never post the same descriptor twice.
+## Dispatch and dependencies
 
-Reject/retain locally when no descriptor/FIFO/mailbox capacity is available.
-The firmware doorbell ISR only puts the index into its 16-entry inbox and
-acknowledges the interrupt. Descriptor copies, DMA polling, and scheduling happen
-in the foreground so slow fetches/FIFO pressure cannot block completion IRQs.
+A free engine takes the oldest ready entry for its codec. Occupied pools and
+unsatisfied dependencies are skipped so another codec/context can progress.
+Selection rotates within each pool; one VP owns at most one PUSH/VP frame.
+After VP DONE that engine is free for another frame, while the old frame keeps
+its distinct FIFO until PP and completion finish.
 
-## Program packets and PIODMA
+Dependency 1 waits until every earlier accepted frame of that context has
+completed PP. VP DONE alone is insufficient. Other contexts can overlap.
+The host also enforces dependencies before submission. Linux defaults to
+`AVD_DEP_PREV_DONE`, including H.264 and HEVC: same-stream VP independence and
+reference/scratch-state safety have not been proven. Codecs may explicitly
+opt into NONE only with that proof and independent per-frame scratch.
 
-`program_words` is in `[1, 0x100000]`. The IOVA is nonzero, four-byte aligned,
-and must leave space for all packets without wrapping u64. Allocate
-`ceil(program_words / 256) * 1028` bytes. Every packet has fixed stride 1028:
+The single SRAM staging buffer stays with a partially fed program. DMA polling
+is bounded; FIFO pressure does not block IRQ handlers. On a full VP queue,
+firmware arms status bit 3 as a not-full interrupt, rechecks occupancy to close
+the drain-before-unmask race, and sleeps. The handler masks/acknowledges FULL
+and wakes the feeder. No occupancy reads occur while waiting for that IRQ.
+This register/IRQ behavior still requires validation on each generation.
+
+## PIODMA packets
+
+Allocate `ceil(program_words / 256) * 1028` bytes. Each packet contains the
+advertised destination header followed by up to 256 payload words. Zero-pad
+the final unused payload words. Packet stride is always 1028 bytes.
+
+Firmware writes the source IOVA low/high at PIODMA `+0x4c/+0x50`, clears stale
+DONE at `+0x04`, then writes `((payload_words + 1) << 8) | 0x11` to `+0x54`.
+It waits with IRQs enabled for DONE bit 0 and acknowledges it before using the
+staged words. The header's destination mechanism and transfer byte units follow
+the public MIT emulator. The header must be trusted kernel input: hardware
+uses it before firmware can inspect the transferred data.
+
+## PP and completions
+
+PP is serialized across codecs and contexts. VP DONE queues that frame for PP.
+When PP is idle firmware writes:
 
 ```
-packet[0]       = info.packet_header;      // same fixed destination each time
-packet[1..256]  = up to 256 instruction words; zero-pad final unused words
+EXEC | REV | FIFO_IDX(fifo) | FIFO_MASK | codec_mask
 ```
 
-For packet p, firmware fetches from `program_iova + p * 1028`. It writes low/high
-IOVA at PIODMA `+0x4c/+0x50` and starts command `((payload_words + 1) << 8) | 0x11`
-at `+0x54`. Command bits 31:6 encode the transfer size in **bytes**, including
-the four-byte packet header (payload words plus one, times four). For comparison, the existing
-Tansy `0x5c11` command fetches 368 bytes: a header plus 91 continuation words.
-It clears stale DONE at `+0x04` before issuing, polls DONE bit 0 without masking interrupts, then
-acknowledges DONE. Polling has a bounded software iteration timeout.
+It then writes `num_segments - 1` continuation EXECs with the same index, mask
+and codec bits and no REV. REV is bit 8 on v2, bit 9 on later images; the codec
+mask is `0xfff000` only for v2 VP9. PP DONE completes exactly the active frame.
 
-Open hardware question: public notes describe the per-segment header as
-`SIZE_words << 18 | DEST | BIT(0)`, while this ABI advertises a header with
-the size field zero and carries the size only in the command register. If
-device bring-up sees PIODMA timeouts, OR `payload_words << 18` into each
-packet header and record which form the engine accepts.
-
-The engine consumes the destination header and places the payload into SRAM
-`+0x9000`. CM3 writes those words to the selected VP instruction FIFO, using
-local stores with conservative spacing. It pauses when the existing per-VP FIFO
-occupancy reaches its capacity and resumes when it drains. Only one packet
-buffer is active at once; all words of a frame are submitted before the next
-frame's program. Multiple complete programs can await VP DONE in the same VP
-FIFO, and different VPs can finish independently. No host per-word MMIO or host
-VP-to-PP interrupt round trip is involved.
-
-The destination header is trusted host input: it **must** equal the advertised
-header. The PIODMA engine follows it before CM3 can inspect the result. This ABI
-is for a trusted kernel backend, not an untrusted DMA command interface. There
-is no guessed direct-I/O-virtual-address load by CM3 and no guessed PIODMA
-FIFO-destination mode: SRAM-to-FIFO CM3 word copies are deliberate.
-
-## VP, PP, and completion
-
-A VP DONE is associated with the oldest fully submitted frame for that VP.
-Firmware queues it for PP and writes its supplied PP kick when PP is idle.
-Exactly one PP frame is active at a time. PP DONE finishes that frame. It never
-sends the legacy VP/PP messages while queue mode is active. Tagged completions
-retire in overall submission order, even if different VPs finish out of order.
-
-The firmware writes status and the **full** completion_tag, issues a DMB, writes
-state=2, issues a DMB, then posts one four-byte outbox word:
+Completed frames publish in submission order per context. A completed context
+can bypass another context's unfinished work. Firmware writes status and the
+full completion tag, DMB, state=2, DMB, then posts:
 
 ```
 0x54530000 | (tag & 0x0000fff0) | ring_index
 ```
 
-Bits 15:4 carry the low 12 sequence bits; bits 3:0 select the record. All u32 tags
-are supported, including `0xffffffff`. The host must test the exact high 16-bit
-prefix before interpreting legacy status bits; `0x5453xxxx` also has some of
-those bits set. After reading the notification, read the descriptor through I/O
-accessors, require state=2, require the short sequence and saved **full** tag to
-match completion_tag, then call `avd_frame_complete(avd, full_tag, status)`.
-Translate statuses 1/2 to `-EINVAL`/`-EIO`. Drain outbox words until the mailbox
-reports empty, acknowledging each using the existing mailbox convention. Only
-then release/reuse that notified index and its successful frame's mappings.
+Outbox pressure never drops or overwrites a completion. The host requires the
+exact prefix, short tag, full tag and state=2 before calling its completion
+handler. It retains its own per-context retirement ordering as well.
 
-Firmware checks outbox EMPTY before publishing; unread notifications are never
-overwritten. A blocked host can stall completion retirement without losing tags
-or overrunning the 16-frame array. The host must drain stale mailbox data before
-boot/reset and must never reuse a tag/index while its old notification remains.
-These ownership rules, not only the 12-bit short sequence, prevent ABA reuse.
+Decode errors, impossible events and PIODMA timeouts halt the shared pipeline.
+Accepted unfinished entries complete with status 2. Duplicate/out-of-capacity
+doorbells also emit `0x5452ffff` after accepted completions drain. These errors
+are not DMA quiescence: the host must reset the entire decoder, stop DMA, drain
+mailboxes and fail outstanding frames before unmapping any buffers. A per-frame
+watchdog remains mandatory. Abort/streamoff resets the shared queue.
 
-Invalid descriptors complete with status 1 without executing any instructions.
-An impossible/duplicate VP or PP event, decode error, or PIODMA timeout halts new
-work and completes all accepted unfinished frames with status 2. Those error
-notifications are **not** proof that hardware/DMA has quiesced: the host must
-reset the whole decoder, stop DMA, drain mailboxes, and fail every outstanding
-frame (including posted descriptors not yet accepted) before unmapping/reusing
-any buffers. A duplicate/out-of-capacity doorbell additionally produces
-`0x5452ffff` after accepted completions drain. This has a different prefix from
-all valid tagged completions. The host must apply the same whole-queue reset.
-Ignore stale notifications across reset generations. Legacy exception/debug mailbox words also require a whole-queue reset in queue
-mode. A per-frame host watchdog
-is mandatory for stalled VP/FIFO/PP and for a DMA/DART fault that never completes.
-A streamoff/abort/suspend drains or resets the entire shared queue; ABI 1 has no
-per-context cancellation message. Reboot/reload explicitly initializes the
-private scheduler, rather than relying on SRAM or BSS being zero.
+## Verification and provenance
 
-## Provenance and verification boundary
-
-The register layout and legacy IRQ path come from this MIT repository and the
-MIT AVD driver in [aurora-silicon/linux](https://github.com/aurora-silicon/linux/tree/aurora-wip/drivers/media/platform/apple/avd).
-The PIODMA packet destination/size mechanism and `0x40070000` base are public in
-[Eileen Yoon's MIT emulator](https://github.com/eiln/avd/blob/main/avd_emu.py).
-The `0x41070000` base and low/high address/command/DONE sequence already exist
-in this repository's v5 Tansy transport (`src/irq.c`, commit `9cbde5c`).
-The v4 PIODMA base is an **inference** from the decode/PIODMA register-bank
-relocation shared with v5; it has not been measured here. Only v5 currently has
-explicit PIODMA boot tunables in this repository. Older engines retain their
-existing platform initialization. SRAM aperture addresses follow the existing
-public DT resource sizes and CM3 aliases.
-
-Builds and host tests establish layout and scheduler behavior, not silicon
-correctness or macOS-like throughput. New queued DMA packet headers, older
-PIODMA initialization/mappings, FIFO capacity behavior, queued END/DONE event
-accounting, per-frame context isolation, and output correctness require the
-lead's device tests. No hardware was requested for this change.
-
-## Reproduce builds and host tests
-
-Requirements: Clang with the ARM bare-metal target, LLD, llvm-objcopy, a native C
-compiler, Meson >=1.4, Ninja. Keep LLVM/LLD tools on PATH.
-
-```sh
+```
 make test
 sh tests/build-all.sh
 python3 tests/check-images.py build/avd-fw-*.bin
+python3 tests/transport-test.py build/avd-fw-*.bin
 meson setup build/meson --cross-file llvm.ini --buildtype=release
 meson compile -C build/meson
 meson test -C build/meson --print-errorlogs
-
-# Optional integration test of actual ARM machine code, with synthetic MMIO:
-python3 -m venv build/test-venv
-build/test-venv/bin/pip install unicorn
-build/test-venv/bin/python tests/transport-test.py build/avd-fw-*.bin
 ```
 
-For the Linux lead, after implementing this ABI and before device qualification:
+The transport test requires Unicorn and llvm-nm. It runs actual CM3 machine
+code with synthetic MMIO/PIODMA for all eight images. Tests cover concurrent
+contexts on VP0/VP1, all codec pools, FIFO bounds, predecessor dependencies,
+serialized multi-segment PP, out-of-order events, ordered tags, outbox pressure,
+FULL wakeup without polling, fatal errors and reset. They prove software
+behavior, not silicon decoding or throughput.
 
-```sh
-make O=out ARCH=arm64 LLVM=1 defconfig
-make O=out ARCH=arm64 LLVM=1 asahi.config
-make O=out ARCH=arm64 LLVM=1 -j8 Image modules dtbs
-```
-
-Run the firmware build/test commands above in the firmware checkout. Kernel
-builds use a controller build slot. Device runs must use controller-approved
-requests with the explicit device identity; install the matching image through
-the lead's normal reversible firmware packaging, retaining the previous image.
-Validate legacy single-frame decode first, then queue depth 1/2/4 and the safe
-per-SoC maximum, compare framemd5 against software decoding for all supported
-codecs/bit depths, and exercise streamoff, watchdog/reset, and tag wrap. Record
-throughput separately; no performance result is claimed by this implementation.
-
-For a patched FFmpeg providing the `v4l2request` hwaccel, these are the exact
-comparison commands (set `clip` to each local test stream and `fmt` to `nv12`
-for 8-bit or `p010le` for 10-bit output supported by that driver):
-
-```sh
-ffmpeg -v error -hwaccel v4l2request -hwaccel_output_format drm_prime \
-  -i "$clip" -map 0:v:0 -an -sn -dn -vf "hwdownload,format=$fmt" \
-  -fps_mode passthrough -f framemd5 -y hw.framemd5
-ffmpeg -v error -i "$clip" -map 0:v:0 -an -sn -dn -pix_fmt "$fmt" \
-  -fps_mode passthrough -f framemd5 -y sw.framemd5
-diff -u sw.framemd5 hw.framemd5
-```
-
-These commands are proposed device validation, not results from this change.
-The backend/codec prepare path must expose the supported download pixel format;
-if the actual driver uses a different format, use that same format on both runs
-and record the difference. Start at queue depth 1, then increase without changing
-the input or output format. Use the existing core's trace/debug instrumentation
-to record maximum in-flight count and tag correlation; ABI 1 adds no queue-depth
-module parameter. To measure steady-state decode independently of output disk
-I/O, repeat the hardware decode with `-benchmark -f null -` as the output.
+Public implementation references are the MIT
+[CM3 submission and VP-to-PP firmware](https://github.com/sofus13/avd-fw/tree/avd-next-fw)
+and [AVD emulator](https://github.com/eiln/avd/blob/main/avd_emu.py).
+Existing repository authorship and MIT notices are retained. No Apple firmware,
+private implementation source or captured payload is added by this change.

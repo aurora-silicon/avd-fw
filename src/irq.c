@@ -517,7 +517,7 @@ static void full(u32 n)
 	u32 *cmd = tansy_active_cmd[n];
 
 	if (avdq_fw_event(n, DECODE_STATUS_FULL)) {
-		reg_write(mask, reg_read(mask) & ~DECODE_STATUS_FULL);
+		avdq_fw_full_mask(n, 0);
 		irq_clear(n, DECODE_STATUS_FULL);
 		return;
 	}
@@ -598,7 +598,20 @@ irq_full(121, 8)
 irq_full(126, 9)
 irq_full(131, 10)
 irq_full(136, 11)
+#else
+static void full(u32 n)
+{
+	if (avdq_fw_event(n, DECODE_STATUS_FULL)) {
+		avdq_fw_full_mask(n, 0);
+		irq_clear(n, DECODE_STATUS_FULL);
+	}
+}
+#define irq_full(n, idx) irq(n) { full(idx); }
+irq_full(81, 0) irq_full(86, 1) irq_full(91, 2) irq_full(96, 3)
+irq_full(101, 4) irq_full(106, 5) irq_full(111, 6) irq_full(116, 7)
+irq_full(121, 8) irq_full(126, 9) irq_full(131, 10) irq_full(136, 11)
 #endif
+irq_full(21, 0) irq_full(26, 1) irq_full(31, 2) irq_full(36, 3)
 
 /* version 2? */
 void irq38(void)
@@ -693,8 +706,8 @@ IRQ(8) IRQ(9) IRQ(10) IRQ(11)
 IRQ(12) IRQ(13) IRQ(14) IRQ(15)
 IRQ(16) IRQ(17)
 
-IRQ(21) IRQ(22) IRQ(26) IRQ(27)
-IRQ(31) IRQ(32) IRQ(36) IRQ(37)
+IRQ(22) IRQ(27)
+IRQ(32) IRQ(37)
 IRQ(39) IRQ(41)
 
 IRQ(42) IRQ(43) IRQ(44) IRQ(45)
@@ -709,18 +722,8 @@ IRQ(66) IRQ(67) IRQ(68) IRQ(69)
 IRQ(70) IRQ(71) IRQ(72) IRQ(73)
 IRQ(74) IRQ(75) IRQ(76) IRQ(77)
 
-#if AVD_VER == 5
 IRQ(82) IRQ(87) IRQ(92) IRQ(97)
 IRQ(102) IRQ(107) IRQ(112) IRQ(117)
 IRQ(122) IRQ(127) IRQ(132) IRQ(137)
-#else
-IRQ(81) IRQ(82) IRQ(86) IRQ(87)
-IRQ(91) IRQ(92) IRQ(96) IRQ(97)
-IRQ(101) IRQ(102) IRQ(106) IRQ(107)
-IRQ(111) IRQ(112) IRQ(116) IRQ(117)
-IRQ(121) IRQ(122)
-IRQ(126) IRQ(127) IRQ(131) IRQ(132)
-IRQ(136) IRQ(137)
-#endif
 IRQ(138) IRQ(139)
 IRQ(140)
