@@ -6,6 +6,7 @@ Requires the optional `unicorn` Python package and llvm-nm on PATH.
 This checks software integration, not silicon register semantics.
 """
 import pathlib
+from functools import cache
 import struct
 import subprocess
 import sys
@@ -13,6 +14,17 @@ import sys
 from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS
 from unicorn import UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_PC
+
+
+@cache
+def image_data(image):
+    elf = image.with_suffix(".elf")
+    if not elf.exists():
+        elf = image.parent.parent / elf.name
+    nm = subprocess.check_output(["llvm-nm", str(elf)], text=True)
+    symbols = {name: int(addr, 16) for addr, kind, name in
+               (line.split() for line in nm.splitlines() if len(line.split()) == 3)}
+    return image.read_bytes(), symbols
 
 
 class Transport:
@@ -24,13 +36,8 @@ class Transport:
         self.uc.mem_map(0x41000000, 0x200000)
         self.uc.mem_map(0x50010000, 0x4000)
         self.uc.mem_map(0xe000e000, 0x2000)
-        self.uc.mem_write(0, image.read_bytes())
-        elf = image.with_suffix(".elf")
-        if not elf.exists():
-            elf = image.parent.parent / elf.name
-        nm = subprocess.check_output(["llvm-nm", str(elf)], text=True)
-        self.symbol = {name: int(addr, 16) for addr, kind, name in
-                       (line.split() for line in nm.splitlines() if len(line.split()) == 3)}
+        data, self.symbol = image_data(image)
+        self.uc.mem_write(0, data)
         self.version, self.tier = map(int, image.stem.removeprefix("avd-fw-v").split("-t"))
         self.decode = 0x40100000 if self.version <= 3 else 0x41100000
         self.dma = 0x40070000 if self.version <= 3 else 0x41070000
@@ -48,7 +55,7 @@ class Transport:
         self.uc.hook_add(UC_HOOK_MEM_READ, self.read)
         self.uc.hook_add(UC_HOOK_MEM_WRITE, self.write)
         self.call("avdq_fw_init")
-        self.info = [self.u32(0x10007fc0 + i * 4) for i in range(11)]
+        self.info = [self.u32(0x10007fc0 + i * 4) for i in range(16)]
         assert self.info[:4] == [0x41565131, 2, 16, 64]
         expected = 0x0108c000 if self.version == 2 else 0x01090000 if self.version == 3 or (self.version == 5 and self.tier == 0) else 0x01094000 if (self.version == 5 and self.tier == 2) else 0x01092000
         assert self.info[4] == expected and self.info[8] == self.vps
@@ -129,10 +136,10 @@ class Transport:
             self.call("avdq_fw_poll")
 
     def vp_done(self, vp=0):
-        self.call(f"irq{20 + vp * 5 if self.version <= 3 else 80 + vp * 5}")
+        self.call(f"irq{20 + vp * 5 if self.version == 2 else 80 + vp * 5}")
 
     def not_full(self, vp=0):
-        self.call(f"irq{21 + vp * 5 if self.version <= 3 else 81 + vp * 5}")
+        self.call(f"irq{21 + vp * 5 if self.version == 2 else 81 + vp * 5}")
 
     def pp_done(self):
         self.call("irq40" if self.version == 2 else "irq64")
@@ -205,7 +212,7 @@ def check(image):
     # Decode errors halt all accepted work; late events cannot kick PP.
     t = Transport(image)
     t.submit(0, 0x50000, [1]); t.submit(1, 0x50001, [2]); t.poll(20)
-    t.call("irq19" if t.version <= 3 else "irq79")
+    t.call("irq19" if t.version == 2 else "irq79")
     t.poll(); t.busy = False; t.poll()
     assert t.result(0) == [2, 2, 0x50000] and t.result(1) == [2, 2, 0x50001]
     t.vp_done(); t.poll()
@@ -223,6 +230,22 @@ def check(image):
     t.submit(0, 0xfffffff0, [3]); t.poll(8)
     t.vp_done(); t.poll(); t.pp_done(); t.poll()
     assert t.result(0) == [2, 0, 0xfffffff0]
+    # Exercise actual IRQ wrappers for every advertised engine of every codec.
+    for codec in range(4):
+        t = Transport(image)
+        base, count = t.info[11 + codec] & 0xff, t.info[11 + codec] >> 8
+        for idx in range(count):
+            t.submit(idx, 0x70000 | idx, [0x100 + idx], codec=codec, context=idx)
+        t.poll(80)
+        assert t.stores == [(base + idx, 0x100 + idx) for idx in range(count)]
+        for idx in reversed(range(count)):
+            t.vp_done(base + idx); t.poll()
+            expected = 0x2b000000 | (idx << 4) | t.info[10] | start
+            if codec == 2 and t.version == 2:
+                expected |= 0xfff000
+            assert t.kicks[-1] == expected
+            t.pp_done(); t.busy = False; t.poll()
+            assert t.result(idx) == [2, 0, 0x70000 | idx]
     print(image.stem + ": concurrent VP0/VP1 contexts, FIFO cap, dependencies, ordered tags, PP continuations, FULL IRQ, error/reset passed", flush=True)
 
 
