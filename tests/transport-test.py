@@ -272,6 +272,15 @@ def check(image):
     t.poll()
     t.not_full()  # A late/pending FULL without a feeder must not keep CM3 awake.
     assert t.idle_sleeps()
+    # PP work counts are full u32 values, including a 256-tile frame.
+    t = Transport(image)
+    t.submit(0, 0x90000, [1] * 256, segments=256); t.poll(300)
+    t.vp_done(); t.poll()
+    assert len(t.kicks) == 256
+    assert t.kicks[0] == 0x2b000000 | start | t.info[10]
+    assert t.kicks[-1] == 0x2b000000 | t.info[10]
+    t.pp_done(); t.poll()
+    assert t.result(0) == [2, 0, 0x90000]
     # An original ABI 1 entry has no metadata flag or FIFO IOVA extension.
     t = Transport(image)
     lo = 0x4068 if t.version == 2 else 0x150 if t.version == 3 else 0x1d0

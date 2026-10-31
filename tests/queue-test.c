@@ -7,7 +7,7 @@
 
 struct fake {
 	unsigned int feeds, kicks, completions, blocked, fail;
-	uint32_t tags[128], statuses[128], words[128];
+	uint32_t tags[128], statuses[128], words[512];
 };
 static int feed(void *cookie, struct avdq_frame *f)
 {
@@ -198,6 +198,22 @@ static void caps_errors(void)
 	avdq_init(&q, &avdq_variants[1]); avdq_pp_done(&q); assert(q.halted);
 	avdq_init(&q, &avdq_variants[1]); avdq_vp_done(&q, 0); assert(q.halted);
 }
+static void wide_pp_count(void)
+{
+	struct avdq q;
+	struct fake io = {0};
+	struct avdq_desc d = descriptor(0x1000, 1, AVDQ_HEVC);
+
+	d.program_words = d.reserved[4] = 256;
+	avdq_init(&q, &avdq_variants[1]);
+	assert(!avdq_submit(&q, 0, &d));
+	for (unsigned int i = 0; i < 256; i++) step(&q, &io);
+	avdq_vp_done(&q, 0); step(&q, &io);
+	assert(io.kicks == 256 && io.words[0] == 0x2b00020f);
+	assert(io.words[255] == 0x2b00000f);
+	avdq_pp_done(&q); step(&q, &io);
+	assert(!q.count && io.tags[0] == d.tag);
+}
 static void legacy_abi_one(void)
 {
 	struct avdq q;
@@ -231,7 +247,7 @@ static void legacy_abi_one(void)
 }
 int main(void)
 {
-	wire(); invalid(); dependencies(); caps_errors(); legacy_abi_one();
+	wire(); invalid(); dependencies(); caps_errors(); legacy_abi_one(); wide_pp_count();
 	for (unsigned int i = 0; i < sizeof(avdq_variants) / sizeof(avdq_variants[0]); i++)
 		pools(&avdq_variants[i]);
 	puts("queue: eight image pools, concurrent contexts, FIFO caps, dependencies, PP continuations, ordered tags, faults passed");
