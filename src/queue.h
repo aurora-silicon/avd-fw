@@ -70,7 +70,8 @@ static inline int avdq_index(uint32_t token, uint32_t ring)
 enum avdq_phase { AVDQ_FREE, AVDQ_PENDING, AVDQ_PUSH, AVDQ_VP,
 	AVDQ_PP_READY, AVDQ_PP, AVDQ_DONE };
 struct avdq_frame {
-	struct avdq_work desc;
+	struct avdq_desc desc; /* Original record for program-source adapters. */
+	struct avdq_work work; /* Normalized scheduling and FIFO ownership. */
 	uint32_t phase, pushed, status, vp;
 };
 struct avdq {

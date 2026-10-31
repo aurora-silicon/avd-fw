@@ -112,8 +112,10 @@ single PP kick exactly. Legacy entries retain overall completion order; the
 legacy host is responsible for codec dependencies. Both forms enforce distinct
 live FIFO ownership and the per-image FIFO budget.
 
-The scheduler receives normalized work, including opaque program-source flags;
-it never interprets PIODMA packets or reads program memory. Only the feed
+The scheduler receives normalized work in frame.work, including opaque
+program-source flags. The original ABI 1 record stays available in frame.desc
+for source adapters. Scheduling never interprets PIODMA packets or reads program
+memory. Only the feed
 adapter handles program transport. Low transport flags are rejected until their
 source adapter is present; adding SRAM-direct does not require a new scheduler.
 The multi-VP root capability and separate info block leave words 11..15 of the

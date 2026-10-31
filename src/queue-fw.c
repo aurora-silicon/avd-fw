@@ -162,10 +162,10 @@ void avdq_fw_full_mask(unsigned int vp, unsigned int enable)
 
 static void configure_fifo(const struct avdq_frame *f)
 {
-	u32 fifo = f->desc.fifo * 4u;
-	uint64_t addr = ((uint64_t)f->desc.fifo_hi << 32) | f->desc.fifo_lo;
+	u32 fifo = f->work.fifo * 4u;
+	uint64_t addr = ((uint64_t)f->work.fifo_hi << 32) | f->work.fifo_lo;
 #if AVD_VER == 2
-	if (f->desc.extended) {
+	if (f->work.extended) {
 		reg_write(REG(DECODE_CTRL_BASE + 0x4068 + fifo), (u32)(addr >> 8));
 		reg_write(REG(DECODE_CTRL_BASE + 0x4084 + fifo), 0);
 		reg_write(REG(DECODE_CTRL_BASE + 0x40a0 + fifo), 0);
@@ -182,7 +182,7 @@ static void configure_fifo(const struct avdq_frame *f)
 	const u32 lo = 0x1d0, hi = 0x20c, mask = 0x248, cach = 0x284, xfer = 0x2c0;
 	const u32 vp_irq = 0x15c, pp_irq = 0x190;
 #endif
-	if (f->desc.extended) {
+	if (f->work.extended) {
 		if (AVDQ_IMAGE_VARIANT->lsr)
 			reg_write(REG(DECODE_CTRL_BASE + lo + fifo), (u32)(addr >> 8));
 		else {

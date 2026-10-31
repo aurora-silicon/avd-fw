@@ -209,7 +209,7 @@ static void legacy_abi_one(void)
 	avdq_init(&q, &avdq_variants[1]);
 	assert(!avdq_submit(&q, 0, &d));
 	step(&q, &io);
-	assert(q.frame[0].phase == AVDQ_VP && !q.frame[0].desc.extended);
+	assert(q.frame[0].phase == AVDQ_VP && !q.frame[0].work.extended);
 	avdq_vp_done(&q, 0); step(&q, &io);
 	assert(io.words[0] == d.pp_kick);
 	avdq_pp_done(&q); step(&q, &io);

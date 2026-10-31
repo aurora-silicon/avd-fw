@@ -67,7 +67,7 @@ static int normalize(const struct avdq *q, const struct avdq_desc *wire,
 	/* A FIFO stays owned through PP and notification publication. */
 	for (i = 0; i < q->count; i++) {
 		const struct avdq_frame *other = &q->frame[q->order[i]];
-		if (other->status == AVDQ_OK && other->desc.fifo == d->fifo)
+		if (other->status == AVDQ_OK && other->work.fifo == d->fifo)
 			return 0;
 	}
 	return 1;
@@ -80,9 +80,10 @@ int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d)
 	    q->frame[idx].phase != AVDQ_FREE || q->halted)
 		return -1;
 	f = &q->frame[idx];
+	f->desc = *d;
 	f->pushed = 0;
 	f->vp = AVDQ_VPS;
-	f->status = normalize(q, d, &f->desc, idx) ? AVDQ_OK : AVDQ_INVALID;
+	f->status = normalize(q, d, &f->work, idx) ? AVDQ_OK : AVDQ_INVALID;
 	f->phase = f->status ? AVDQ_DONE : AVDQ_PENDING;
 	q->order[q->count++] = idx;
 	return 0;
@@ -135,7 +136,7 @@ static int predecessor(const struct avdq *q, unsigned int pos, int unfinished)
 	const struct avdq_frame *f = &q->frame[q->order[pos]];
 	for (i = 0; i < pos; i++) {
 		const struct avdq_frame *p = &q->frame[q->order[i]];
-		if (p->desc.context == f->desc.context &&
+		if (p->work.context == f->work.context &&
 		    (!unfinished || p->phase != AVDQ_DONE))
 			return 1;
 	}
@@ -187,12 +188,12 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
 			continue;
 		q->pp_active = (int)idx;
 		f->phase = AVDQ_PP;
-		word = AVDQ_EXEC | (f->desc.fifo << 4) | q->variant->fifo_mask;
-		if (f->desc.codec == AVDQ_VP9 && q->variant->exec_start == 8)
+		word = AVDQ_EXEC | (f->work.fifo << 4) | q->variant->fifo_mask;
+		if (f->work.codec == AVDQ_VP9 && q->variant->exec_start == 8)
 			word |= 0xfff000u;
-		ops->kick(cookie, f->desc.extended ?
-			  word | (1u << q->variant->exec_start) : f->desc.pp_kick);
-		for (j = 1; j < f->desc.num_segments; j++)
+		ops->kick(cookie, f->work.extended ?
+			  word | (1u << q->variant->exec_start) : f->work.pp_kick);
+		for (j = 1; j < f->work.num_segments; j++)
 			ops->kick(cookie, word);
 	}
 	/* A single PIODMA staging buffer must stay with its partially fed frame. */
@@ -204,9 +205,9 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
 			struct avdq_frame *f = &q->frame[q->order[i]];
 			int vp;
 			if (f->phase != AVDQ_PENDING ||
-			    (f->desc.dependency == AVDQ_DEP_PREV_DONE && predecessor(q, i, 1)))
+			    (f->work.dependency == AVDQ_DEP_PREV_DONE && predecessor(q, i, 1)))
 				continue;
-			vp = free_vp(q, f->desc.codec);
+			vp = free_vp(q, f->work.codec);
 			if (vp < 0)
 				continue;
 			f->vp = (unsigned int)vp;
