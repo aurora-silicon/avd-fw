@@ -61,8 +61,8 @@ struct queue_fw {
 	struct avdq q;
 	volatile unsigned int mode, fatal, in_write, in_read;
 	volatile unsigned int inbox[AVDQ_COUNT];
-	volatile unsigned int vp_done[12], pp_done, error, vp_ready;
-	unsigned int fifo_wait, runnable;
+	volatile unsigned int vp_done[12], pp_done, error, vp_ready, fifo_wait;
+	unsigned int runnable;
 	unsigned int dma_pending, dma_wait, stage_words, stage_used;
 };
 #define FW ((struct queue_fw *)(SRAM_ALIAS + 0x6000u))
@@ -123,7 +123,7 @@ int avdq_fw_event(unsigned int vp, unsigned int event)
 	if (!FW->mode)
 		return 0;
 	if (event == DECODE_STATUS_FULL) {
-		if (vp < VP_COUNT)
+		if (vp < VP_COUNT && (FW->fifo_wait & (1u << vp)))
 			FW->vp_ready |= 1u << vp;
 		return 1;
 	}

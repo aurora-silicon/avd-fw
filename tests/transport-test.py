@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS
-from unicorn import UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE
+from unicorn import UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE, UC_HOOK_CODE
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_PC
 
 
@@ -144,6 +144,24 @@ class Transport:
     def pp_done(self):
         self.call("irq40" if self.version == 2 else "irq64")
 
+    def idle_sleeps(self):
+        saw_wfi = []
+
+        def inspect(uc, addr, size, user):
+            if bytes(uc.mem_read(addr, 2)) == b"\x30\xbf":
+                saw_wfi.append(True)
+                uc.emu_stop()
+
+        hook = self.uc.hook_add(UC_HOOK_CODE, inspect)
+        try:
+            self.call("avdq_fw_idle")
+        except AssertionError:
+            if not saw_wfi:
+                raise
+        finally:
+            self.uc.hook_del(hook)
+        return bool(saw_wfi)
+
     def result(self, idx):
         return [self.u32(0x10008000 + idx * 64 + off) for off in (0x20, 0x24, 0x28)]
 
@@ -230,6 +248,9 @@ def check(image):
     t.submit(0, 0xfffffff0, [3]); t.poll(8)
     t.vp_done(); t.poll(); t.pp_done(); t.poll()
     assert t.result(0) == [2, 0, 0xfffffff0]
+    t.poll()
+    t.not_full()  # A late/pending FULL without a feeder must not keep CM3 awake.
+    assert t.idle_sleeps()
     # Exercise actual IRQ wrappers for every advertised engine of every codec.
     for codec in range(4):
         t = Transport(image)
