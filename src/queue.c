@@ -13,24 +13,63 @@ void avdq_init(struct avdq *q, const struct avdq_variant *variant)
 		q->frame[i].phase = AVDQ_FREE;
 }
 
-static int valid(const struct avdq *q, const struct avdq_desc *d, unsigned int idx)
+static int normalize(const struct avdq *q, const struct avdq_desc *wire,
+		     struct avdq_work *d, unsigned int idx)
 {
-	uint64_t addr = ((uint64_t)d->program_hi << 32) | d->program_lo;
-	uint64_t packets = ((uint64_t)d->program_words + AVDQ_PACKET_WORDS - 1u) /
+	uint64_t addr = ((uint64_t)wire->program_hi << 32) | wire->program_lo;
+	uint64_t packets = ((uint64_t)wire->program_words + AVDQ_PACKET_WORDS - 1u) /
 			   AVDQ_PACKET_WORDS;
-	uint64_t fifo = ((uint64_t)d->fifo_hi << 32) | d->fifo_lo;
+	unsigned int i;
+	d->magic = wire->magic;
+	d->tag = wire->tag;
+	d->codec = wire->codec;
+	d->fifo = (wire->pp_kick >> 4) & 15u;
+	d->program_lo = wire->program_lo;
+	d->program_hi = wire->program_hi;
+	d->program_words = wire->program_words;
+	d->state = wire->state;
+	d->pp_kick = wire->pp_kick;
+	d->flags = wire->reserved[0];
+	d->extended = !!(d->flags & AVDQ_FLAG_MULTI_VP);
+	d->context = 0; /* Legacy ABI 1 publishes in overall submission order. */
+	d->dependency = AVDQ_DEP_NONE;
+	d->fifo_lo = d->fifo_hi = 0;
+	d->num_segments = 1;
+	if (d->flags & ~(AVDQ_FLAG_MULTI_VP | AVDQ_TRANSPORT_FLAGS))
+		return 0;
+	if (d->extended) {
+		uint64_t fifo = ((uint64_t)wire->reserved[3] << 32) | wire->reserved[2];
+		if ((wire->reserved[1] & ~(AVDQ_CONTEXT_MASK | AVDQ_CONTEXT_DEP)) ||
+		    !fifo || (fifo & 255u) || (q->variant->lsr && fifo >= (1ull << 38)))
+			return 0;
+		d->context = wire->reserved[1] & AVDQ_CONTEXT_MASK;
+		d->dependency = !!(wire->reserved[1] & AVDQ_CONTEXT_DEP);
+		d->fifo_lo = wire->reserved[2];
+		d->fifo_hi = wire->reserved[3];
+		d->num_segments = wire->reserved[4];
+		if (d->fifo != idx)
+			return 0;
+	} else {
+		for (i = 1; i < 5; i++)
+			if (wire->reserved[i])
+				return 0;
+	}
 	if (d->magic != AVDQ_MAGIC || (d->tag & 15u) != idx ||
 	    d->state != AVDQ_SUBMITTED || d->codec > AVDQ_AV1 ||
-	    !q->variant->count[d->codec] || d->fifo != idx ||
-	    idx >= q->variant->fifo_slots || !addr || (addr & 3u) ||
+	    !q->variant->count[d->codec] ||
+	    (!d->extended && (wire->vp_slot < q->variant->base[d->codec] ||
+	     wire->vp_slot >= q->variant->base[d->codec] + q->variant->count[d->codec])) ||
+	    d->fifo >= q->variant->fifo_slots || !wire->pp_kick || !addr || (addr & 3u) ||
 	    !d->program_words || d->program_words > AVDQ_MAX_WORDS ||
 	    addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES ||
-	    !d->num_segments || d->num_segments > d->program_words ||
-	    d->dependency > AVDQ_DEP_PREV_DONE ||
-	    !fifo || (fifo & 255u) || (q->variant->lsr && fifo >= (1ull << 38)))
+	    !d->num_segments || d->num_segments > d->program_words)
 		return 0;
-	if (d->reserved)
-		return 0;
+	/* A FIFO stays owned through PP and notification publication. */
+	for (i = 0; i < q->count; i++) {
+		const struct avdq_frame *other = &q->frame[q->order[i]];
+		if (other->status == AVDQ_OK && other->desc.fifo == d->fifo)
+			return 0;
+	}
 	return 1;
 }
 
@@ -41,10 +80,9 @@ int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d)
 	    q->frame[idx].phase != AVDQ_FREE || q->halted)
 		return -1;
 	f = &q->frame[idx];
-	f->desc = *d;
 	f->pushed = 0;
 	f->vp = AVDQ_VPS;
-	f->status = valid(q, d, idx) ? AVDQ_OK : AVDQ_INVALID;
+	f->status = normalize(q, d, &f->desc, idx) ? AVDQ_OK : AVDQ_INVALID;
 	f->phase = f->status ? AVDQ_DONE : AVDQ_PENDING;
 	q->order[q->count++] = idx;
 	return 0;
@@ -152,7 +190,8 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
 		word = AVDQ_EXEC | (f->desc.fifo << 4) | q->variant->fifo_mask;
 		if (f->desc.codec == AVDQ_VP9 && q->variant->exec_start == 8)
 			word |= 0xfff000u;
-		ops->kick(cookie, word | (1u << q->variant->exec_start));
+		ops->kick(cookie, f->desc.extended ?
+			  word | (1u << q->variant->exec_start) : f->desc.pp_kick);
 		for (j = 1; j < f->desc.num_segments; j++)
 			ops->kick(cookie, word);
 	}

@@ -41,13 +41,14 @@ static struct avdq_desc descriptor(unsigned int tag, unsigned int context, unsig
 	d.magic = AVDQ_MAGIC;
 	d.tag = tag;
 	d.codec = codec;
-	d.fifo = tag & 15u;
+	d.pp_kick = AVDQ_EXEC | ((tag & 15u) << 4);
+	d.reserved[0] = AVDQ_FLAG_MULTI_VP;
 	d.program_lo = 0x4000;
 	d.program_hi = 1;
-	d.program_words = d.num_segments = 1;
-	d.context = context;
+	d.program_words = d.reserved[4] = 1;
+	d.reserved[1] = context;
 	d.state = AVDQ_SUBMITTED;
-	d.fifo_lo = 0x1000000 + d.fifo * 0x1000000;
+	d.reserved[2] = 0x1000000 + (tag & 15u) * 0x1000000;
 	return d;
 }
 static void step(struct avdq *q, struct fake *io)
@@ -58,7 +59,7 @@ static void wire(void)
 {
 	unsigned int i;
 	assert(offsetof(struct avdq_desc, program_lo) == 0x10);
-	assert(offsetof(struct avdq_desc, context) == 0x2c);
+	assert(offsetof(struct avdq_desc, reserved) == 0x2c);
 	for (i = 0; i < 16; i++) {
 		assert(avdq_index(0x1098000u + i * 64, 0x1098000u) == (int)i);
 		assert(avdq_index(0x1098001u + i * 64, 0x1098000u) < 0);
@@ -87,16 +88,16 @@ static void invalid(void)
 		case 2: d.state = AVDQ_COMPLETE; break;
 		case 3: d.codec = 32; break;
 		case 4: d.codec = AVDQ_AV1; break;
-		case 5: d.fifo = 1; break;
+		case 5: d.pp_kick ^= 0x10; break;
 		case 6: d.program_lo = d.program_hi = 0; break;
 		case 7: d.program_lo++; break;
 		case 8: d.program_words = 0; break;
 		case 9: d.program_words = AVDQ_MAX_WORDS + 1; break;
 		case 10: d.program_lo = 0xfffffffcu; d.program_hi = 0xffffffffu; break;
-		case 11: d.num_segments = 0; break;
-		case 12: d.reserved = 1; break;
-		case 13: d.num_segments = 2; break;
-		case 14: d.dependency = 2; break;
+		case 11: d.reserved[4] = 0; break;
+		case 12: d.reserved[0] |= 1; break;
+		case 13: d.reserved[4] = 2; break;
+		case 14: d.reserved[1] |= 1u << 10; break;
 		}
 		assert(!avdq_submit(&q, 0, &d));
 		assert(q.frame[0].phase == AVDQ_DONE);
@@ -146,8 +147,8 @@ static void dependencies(void)
 	struct avdq_desc a = descriptor(0x1000, 42, AVDQ_HEVC);
 	struct avdq_desc b = descriptor(0x2001, 42, AVDQ_HEVC);
 	struct avdq_desc c = descriptor(0x3002, 99, AVDQ_HEVC);
-	b.dependency = AVDQ_DEP_PREV_DONE;
-	a.program_words = a.num_segments = 3;
+	b.reserved[1] |= AVDQ_CONTEXT_DEP;
+	a.program_words = a.reserved[4] = 3;
 	avdq_init(&q, &avdq_variants[1]);
 	avdq_submit(&q, 0, &a); avdq_submit(&q, 1, &b); avdq_submit(&q, 2, &c);
 	for (unsigned int i = 0; i < 5; i++) step(&q, &io);
@@ -164,7 +165,7 @@ static void dependencies(void)
 	assert(io.tags[0] == a.tag && q.frame[1].phase == AVDQ_VP);
 	/* Independent frames of one ctx may finish in reverse, retire in order. */
 	avdq_init(&q, &avdq_variants[1]); memset(&io, 0, sizeof(io));
-	a.program_words = a.num_segments = 1; b.dependency = AVDQ_DEP_NONE;
+	a.program_words = a.reserved[4] = 1; b.reserved[1] &= ~AVDQ_CONTEXT_DEP;
 	avdq_submit(&q, 0, &a); avdq_submit(&q, 1, &b);
 	step(&q, &io); step(&q, &io);
 	avdq_vp_done(&q, 1); step(&q, &io); avdq_pp_done(&q); step(&q, &io);
@@ -194,9 +195,31 @@ static void caps_errors(void)
 	avdq_init(&q, &avdq_variants[1]); avdq_pp_done(&q); assert(q.halted);
 	avdq_init(&q, &avdq_variants[1]); avdq_vp_done(&q, 0); assert(q.halted);
 }
+static void legacy_abi_one(void)
+{
+	struct avdq q;
+	struct fake io = {0};
+	struct avdq_desc d = descriptor(0x1000, 0, AVDQ_HEVC);
+
+	memset(d.reserved, 0, sizeof(d.reserved));
+	d.pp_kick = 0x2b000400;
+	avdq_init(&q, &avdq_variants[1]);
+	assert(!avdq_submit(&q, 0, &d));
+	step(&q, &io);
+	assert(q.frame[0].phase == AVDQ_VP && !q.frame[0].desc.extended);
+	avdq_vp_done(&q, 0); step(&q, &io);
+	assert(io.words[0] == d.pp_kick);
+	avdq_pp_done(&q); step(&q, &io);
+	assert(io.completions == 1 && io.tags[0] == d.tag);
+	avdq_init(&q, &avdq_variants[1]);
+	assert(!avdq_submit(&q, 0, &d));
+	d.tag++;
+	assert(!avdq_submit(&q, 1, &d));
+	assert(q.frame[1].status == AVDQ_INVALID); /* Duplicate FIFO ownership. */
+}
 int main(void)
 {
-	wire(); invalid(); dependencies(); caps_errors();
+	wire(); invalid(); dependencies(); caps_errors(); legacy_abi_one();
 	for (unsigned int i = 0; i < sizeof(avdq_variants) / sizeof(avdq_variants[0]); i++)
 		pools(&avdq_variants[i]);
 	puts("queue: eight image pools, concurrent contexts, FIFO caps, dependencies, PP continuations, ordered tags, faults passed");

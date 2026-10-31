@@ -3,7 +3,7 @@
 #define AVD_FW_QUEUE_H
 #include <stdint.h>
 #include "variant.h"
-#define AVDQ_VERSION 2u
+#define AVDQ_VERSION 1u
 #define AVDQ_MAGIC 0x41565131u
 #define AVDQ_COUNT 16u
 #define AVDQ_DESC_BYTES 64u
@@ -24,11 +24,27 @@
 #define AVDQ_EXEC 0x2b000000u
 
 enum avdq_codec { AVDQ_HEVC, AVDQ_H264, AVDQ_VP9, AVDQ_AV1 };
-/* ABI 2. FIFO index equals ring index; VP selection belongs to firmware. */
+#define AVDQ_MULTI_INFO_OFFSET 0x7f80u
+#define AVDQ_MULTI_MAGIC 0x41564d31u /* AVM1 */
+#define AVDQ_MULTI_VERSION 1u
+#define AVDQ_CAP_MULTI_VP (1u << 31)
+#define AVDQ_FLAG_MULTI_VP (1u << 31)
+#define AVDQ_TRANSPORT_FLAGS 0u /* Program-source adapters extend this mask. */
+#define AVDQ_CONTEXT_MASK 0x3ffu
+#define AVDQ_CONTEXT_DEP (1u << 31)
+
+/* ABI 1 wire layout. Low reserved[0] bits remain available to transports. */
 struct avdq_desc {
+	uint32_t magic, tag, codec, vp_slot;
+	uint32_t program_lo, program_hi, program_words, pp_kick;
+	uint32_t state, status, completion_tag, reserved[5];
+};
+/* Normalized work is independent of the wire extension and program source. */
+struct avdq_work {
 	uint32_t magic, tag, codec, fifo;
 	uint32_t program_lo, program_hi, program_words, num_segments;
-	uint32_t state, status, completion_tag, context, dependency, fifo_lo, fifo_hi, reserved;
+	uint32_t state, status, completion_tag, context, dependency;
+	uint32_t fifo_lo, fifo_hi, pp_kick, extended, flags;
 };
 _Static_assert(sizeof(struct avdq_desc) == AVDQ_DESC_BYTES, "wire size");
 static inline uint32_t avdq_packet_header(uint32_t dst)
@@ -54,7 +70,7 @@ static inline int avdq_index(uint32_t token, uint32_t ring)
 enum avdq_phase { AVDQ_FREE, AVDQ_PENDING, AVDQ_PUSH, AVDQ_VP,
 	AVDQ_PP_READY, AVDQ_PP, AVDQ_DONE };
 struct avdq_frame {
-	struct avdq_desc desc;
+	struct avdq_work desc;
 	uint32_t phase, pushed, status, vp;
 };
 struct avdq {

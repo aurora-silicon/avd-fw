@@ -55,6 +55,7 @@
 		   AVDQ_RING_OFFSET + (i) * AVDQ_DESC_BYTES))
 #define Q_STAGE REG(SRAM_ALIAS + AVDQ_STAGE_OFFSET)
 #define Q_INFO REG(SRAM_ALIAS + 0x7fc0u)
+#define Q_MULTI_INFO REG(SRAM_ALIAS + AVDQ_MULTI_INFO_OFFSET)
 
 /* Explicit SRAM placement: no dependency on the legacy uninitialized BSS. */
 struct queue_fw {
@@ -66,7 +67,7 @@ struct queue_fw {
 	unsigned int dma_pending, dma_wait, stage_words, stage_used;
 };
 #define FW ((struct queue_fw *)(SRAM_ALIAS + 0x6000u))
-_Static_assert(sizeof(struct queue_fw) <= 0x1fc0u, "SRAM queue state overlaps ABI");
+_Static_assert(sizeof(struct queue_fw) <= 0x1f80u, "SRAM queue state overlaps ABI");
 
 static void barrier(void)
 {
@@ -80,8 +81,10 @@ void avdq_fw_init(void)
 	for (i = 0; i < sizeof(*FW) / sizeof(*p); i++)
 		p[i] = 0;
 	avdq_init(&FW->q, AVDQ_IMAGE_VARIANT);
-	for (i = 0; i < 16; i++)
+	for (i = 0; i < 16; i++) {
 		Q_INFO[i] = 0;
+		Q_MULTI_INFO[i] = 0;
+	}
 	Q_INFO[1] = AVDQ_VERSION;
 	Q_INFO[2] = AVDQ_COUNT;
 	Q_INFO[3] = AVDQ_DESC_BYTES;
@@ -90,11 +93,15 @@ void avdq_fw_init(void)
 	Q_INFO[6] = AVDQ_PACKET_WORDS;
 	Q_INFO[7] = avdq_packet_header(SRAM_APERTURE + AVDQ_STAGE_OFFSET);
 	Q_INFO[8] = VP_COUNT;
-	Q_INFO[9] = AVD_VER <= 3 ? 7u : 15u;
+	Q_INFO[9] = (AVD_VER <= 3 ? 7u : 15u) | AVDQ_CAP_MULTI_VP;
 	Q_INFO[10] = FIFO_SLOTS;
 	for (i = 0; i < 4; i++)
-		Q_INFO[11 + i] = AVDQ_IMAGE_VARIANT->base[i] |
+		Q_MULTI_INFO[2 + i] = AVDQ_IMAGE_VARIANT->base[i] |
 			(AVDQ_IMAGE_VARIANT->count[i] << 8);
+	Q_MULTI_INFO[1] = AVDQ_MULTI_VERSION;
+	Q_MULTI_INFO[6] = AVDQ_FLAG_MULTI_VP;
+	barrier();
+	Q_MULTI_INFO[0] = AVDQ_MULTI_MAGIC;
 	barrier();
 	Q_INFO[0] = AVDQ_MAGIC;
 }
@@ -158,10 +165,12 @@ static void configure_fifo(const struct avdq_frame *f)
 	u32 fifo = f->desc.fifo * 4u;
 	uint64_t addr = ((uint64_t)f->desc.fifo_hi << 32) | f->desc.fifo_lo;
 #if AVD_VER == 2
-	reg_write(REG(DECODE_CTRL_BASE + 0x4068 + fifo), (u32)(addr >> 8));
-	reg_write(REG(DECODE_CTRL_BASE + 0x4084 + fifo), 0);
-	reg_write(REG(DECODE_CTRL_BASE + 0x40a0 + fifo), 0);
-	reg_write(REG(DECODE_CTRL_BASE + 0x40bc + fifo), 0);
+	if (f->desc.extended) {
+		reg_write(REG(DECODE_CTRL_BASE + 0x4068 + fifo), (u32)(addr >> 8));
+		reg_write(REG(DECODE_CTRL_BASE + 0x4084 + fifo), 0);
+		reg_write(REG(DECODE_CTRL_BASE + 0x40a0 + fifo), 0);
+		reg_write(REG(DECODE_CTRL_BASE + 0x40bc + fifo), 0);
+	}
 	reg_write(REG(DECODE_CTRL_BASE + 0x4040 + f->vp * 4), 0);
 	u32 *mask = REG(DECODE_CTRL_BASE + 0x405c);
 	reg_write(mask, reg_read(mask) | (7u << (f->vp * 5)) | (5u << 20));
@@ -173,15 +182,17 @@ static void configure_fifo(const struct avdq_frame *f)
 	const u32 lo = 0x1d0, hi = 0x20c, mask = 0x248, cach = 0x284, xfer = 0x2c0;
 	const u32 vp_irq = 0x15c, pp_irq = 0x190;
 #endif
-	if (AVDQ_IMAGE_VARIANT->lsr)
-		reg_write(REG(DECODE_CTRL_BASE + lo + fifo), (u32)(addr >> 8));
-	else {
-		reg_write(REG(DECODE_CTRL_BASE + hi + fifo), (u32)(addr >> 32));
-		reg_write(REG(DECODE_CTRL_BASE + lo + fifo), (u32)addr);
+	if (f->desc.extended) {
+		if (AVDQ_IMAGE_VARIANT->lsr)
+			reg_write(REG(DECODE_CTRL_BASE + lo + fifo), (u32)(addr >> 8));
+		else {
+			reg_write(REG(DECODE_CTRL_BASE + hi + fifo), (u32)(addr >> 32));
+			reg_write(REG(DECODE_CTRL_BASE + lo + fifo), (u32)addr);
+		}
+		reg_write(REG(DECODE_CTRL_BASE + mask + fifo), 0);
+		reg_write(REG(DECODE_CTRL_BASE + cach + fifo), 0);
+		reg_write(REG(DECODE_CTRL_BASE + xfer + fifo), 0);
 	}
-	reg_write(REG(DECODE_CTRL_BASE + mask + fifo), 0);
-	reg_write(REG(DECODE_CTRL_BASE + cach + fifo), 0);
-	reg_write(REG(DECODE_CTRL_BASE + xfer + fifo), 0);
 	u32 *vp_mask = REG(DECODE_CTRL_BASE + vp_irq + f->vp * 4);
 	u32 *pp_mask = REG(DECODE_CTRL_BASE + pp_irq);
 	reg_write(vp_mask, reg_read(vp_mask) | 7u);

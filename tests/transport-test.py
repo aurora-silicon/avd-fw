@@ -56,10 +56,14 @@ class Transport:
         self.uc.hook_add(UC_HOOK_MEM_WRITE, self.write)
         self.call("avdq_fw_init")
         self.info = [self.u32(0x10007fc0 + i * 4) for i in range(16)]
-        assert self.info[:4] == [0x41565131, 2, 16, 64]
+        assert self.info[:4] == [0x41565131, 1, 16, 64]
         expected = 0x0108c000 if self.version == 2 else 0x01090000 if self.version == 3 or (self.version == 5 and self.tier == 0) else 0x01094000 if (self.version == 5 and self.tier == 2) else 0x01092000
         assert self.info[4] == expected and self.info[8] == self.vps
         assert self.info[10] == (7 if self.version == 2 or (self.version == 5 and self.tier == 0) else 15)
+        self.multi = [self.u32(0x10007f80 + i * 4) for i in range(7)]
+        assert self.info[9] & 0x80000000
+        assert self.multi[:2] == [0x41564d31, 1] and self.multi[6] == 0x80000000
+        assert self.info[11:] == [0] * 5  # Reserved for transport extensions.
         self.ring = self.info[4] + self.info[5]
 
     def u32(self, addr):
@@ -117,15 +121,18 @@ class Transport:
             self.notifications.append(value)
         # irq_clear() writes W1C decode status then waits for the ack.
         status = self.decode + (0x4060 if self.version == 2 else 0x124 if self.version == 3 else 0x194)
-        if status <= addr <= status + 13 * 4:
+        if (addr == status if self.version == 2 else status <= addr <= status + self.pp_idx * 4):
             self.clear.add(addr)
 
-    def submit(self, idx, tag, words, codec=0, context=0, dep=0, segments=1):
+    def submit(self, idx, tag, words, codec=0, context=0, dep=0, segments=1, extended=True):
         source = 0x100004000 + idx * 0x10000
         for p in range((len(words) + 255) // 256):
             self.packets[source + p * 1028] = (self.info[7], words[p * 256:(p + 1) * 256])
-        desc = [0x41565131, tag, codec, idx, source & 0xffffffff, source >> 32,
-                len(words), segments, 1, 0, 0, context, dep, 0x1000000 + idx * 0x1000000, 0, 0]
+        base = self.multi[2 + codec] & 0xff
+        reserved = [0x80000000, context | (dep << 31),
+                    0x1000000 + idx * 0x1000000, 0, segments] if extended else [0] * 5
+        desc = [0x41565131, tag, codec, base, source & 0xffffffff, source >> 32,
+                len(words), 0x2b000400 | (idx << 4), 1, 0, 0, *reserved]
         self.uc.mem_write(0x10008000 + idx * 64, struct.pack("<16I", *desc))
         # Exercise the actual mailbox IRQ wrapper and interrupt acknowledgement.
         self.put(0x50010058, self.ring + idx * 64)
@@ -251,10 +258,20 @@ def check(image):
     t.poll()
     t.not_full()  # A late/pending FULL without a feeder must not keep CM3 awake.
     assert t.idle_sleeps()
+    # An original ABI 1 entry has no metadata flag or FIFO IOVA extension.
+    t = Transport(image)
+    lo = 0x4068 if t.version == 2 else 0x150 if t.version == 3 else 0x1d0
+    t.put(t.decode + lo, 0xabc000)
+    t.submit(0, 0x80000, [7], extended=False); t.poll(10)
+    assert t.u32(t.decode + lo) == 0xabc000
+    t.vp_done(); t.poll()
+    assert t.kicks == [0x2b000400]  # Legacy caller-supplied PP kick stays exact.
+    t.pp_done(); t.poll()
+    assert t.result(0) == [2, 0, 0x80000]
     # Exercise actual IRQ wrappers for every advertised engine of every codec.
     for codec in range(4):
         t = Transport(image)
-        base, count = t.info[11 + codec] & 0xff, t.info[11 + codec] >> 8
+        base, count = t.multi[2 + codec] & 0xff, t.multi[2 + codec] >> 8
         for idx in range(count):
             t.submit(idx, 0x70000 | idx, [0x100 + idx], codec=codec, context=idx)
         t.poll(80)

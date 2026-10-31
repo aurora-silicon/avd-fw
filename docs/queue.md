@@ -1,4 +1,4 @@
-# Open firmware queue ABI 2
+# Open firmware queue ABI 1 with multi-VP metadata
 
 This MIT protocol carries host-generated VP instruction programs to the CM3.
 Firmware selects the VP, configures the frame's hardware FIFO, chains VP to PP,
@@ -6,9 +6,10 @@ and publishes tagged completions. It is separate from the Apple firmware ABI.
 Firmware retains the legacy interrupt protocol until its first queue doorbell.
 A hardware reset and firmware boot are required to leave queue mode.
 
-ABI 2 intentionally rejects ABI 1 descriptors. Both endpoints must be updated.
-The version is published before the boot-ready flag. There is no negotiation
-that silently interprets one descriptor layout as the other.
+The original ABI 1 descriptor layout and version stay intact. Multi-VP clients
+negotiate the extension described below and set its descriptor flag. Existing
+ABI 1 entries remain supported with their caller-supplied FIFO setup and PP kick.
+Transport selection stays separate from normalized frame work and VP scheduling.
 
 ## Images and pools
 
@@ -36,23 +37,30 @@ SRAM resource at offset `0x7fc0` after boot-ready:
 | Word | Value |
 | --- | --- |
 | 0 | magic `0x41565131`, published last |
-| 1 | ABI version 2 |
+| 1 | ABI version 1 |
 | 2, 3 | descriptor count 16, stride 64 bytes |
 | 4 | SRAM aperture address in the doorbell address space |
 | 5, 6 | ring offset `0x8000`, packet payload size 256 words |
 | 7 | PIODMA destination header, use verbatim |
-| 8, 9 | VP register index limit, supported codec mask |
+| 8 | VP register index limit |
+| 9 | codec mask in bits 3:0; bit 31 advertises multi-VP metadata |
 | 10 | independent FIFO slots, 7 or 15 |
-| 11..14 | one codec pool each: base index in bits 7:0, count in bits 15:8 |
-| 15 | reserved, zero |
+| 11..15 | reserved for program-source transport extensions |
 
 Codecs are HEVC=0, H.264=1, VP9=2, AV1=3. The VP limit is an address bound,
-not an engine count: tier 0 has holes. Host match data and advertised pool
-geometry must agree. Absent magic allows legacy operation; an unknown ABI
-version must never be submitted.
+not an engine count: tier 0 has holes. Missing magic allows legacy operation;
+an unknown ABI version must never receive queued descriptors.
+
+If root word 9 has bit 31 set, read the separate 64-byte extension block at
+SRAM `+0x7f80`: word 0 magic `0x41564d31` (AVM1), word 1 extension version 1,
+words 2..5 one codec pool each (base in bits 7:0, count in bits 15:8), word 6
+descriptor flag mask (bit 31 for multi-VP metadata), remaining words zero.
+Require both the root capability and extension magic/version. The root bit is
+cleared by old firmware at boot, so stale extension SRAM cannot masquerade as
+support after an image rollback. Host match data and pool geometry must agree.
 
 CM3 sees SRAM byte zero at `0x10000000`. Private queue state occupies
-`+0x6000..+0x7fbf`, descriptors `+0x8000..+0x83ff`, and the single staging
+`+0x6000..+0x7f7f`, extension info `+0x7f80..+0x7fbf`, descriptors `+0x8000..+0x83ff`, and the single staging
 buffer `+0x9000..+0x93ff`. The smallest supported SRAM is `0xc000` bytes.
 The host must not use these regions for scratch or legacy commands.
 
@@ -72,39 +80,52 @@ Both decode and PIODMA DART stream IDs must be attached to its DMA domain.
 
 ## Descriptor and ownership
 
-Each descriptor is 64 bytes (`src/queue.h`):
+Each descriptor remains 64 bytes (`src/queue.h`):
 
-| Offset | Field | Meaning |
+| Offset | ABI 1 field | Meaning |
 | --- | --- | --- |
 | 0x00 | magic | `0x41565131` |
 | 0x04 | tag | full u32, low nibble equals ring index |
 | 0x08 | codec | 0..3 |
-| 0x0c | fifo | must equal ring index and be less than FIFO slots |
-| 0x10, 0x14 | program_lo/hi | packet buffer DMA address |
+| 0x0c | vp_slot | legacy VP hint; extended entries let firmware select the VP |
+| 0x10, 0x14 | program_lo/hi | program source address |
 | 0x18 | program_words | payload words, 1..0x100000 |
-| 0x1c | num_segments | PP EXEC count, 1..program_words |
+| 0x1c | pp_kick | legacy PP kick; bits 7:4 carry the FIFO index for all entries |
 | 0x20 | state | host publishes 1, firmware publishes 2 |
 | 0x24 | status | firmware: 0 success, 1 invalid, 2 fatal I/O |
 | 0x28 | completion_tag | full submitted tag, unmodified |
-| 0x2c | context | opaque context identity, unique among live clients |
-| 0x30 | dependency | 0 independent, 1 previous context work DONE |
-| 0x34, 0x38 | fifo_lo/hi | distinct frame-owned instruction FIFO DMA address |
-| 0x3c | reserved | zero |
+| 0x2c | reserved[0] | bit 31 enables multi-VP metadata; low bits remain transport flags |
+| 0x30 | reserved[1] | context in bits 9:0, PREV_DONE in bit 31, other bits zero |
+| 0x34, 0x38 | reserved[2..3] | frame-owned FIFO DMA address low/high |
+| 0x3c | reserved[4] | PP EXEC count, 1..program_words |
 
-Only indices `0..fifo_slots-1` may execute. The sentinel ring entry is not an
-extra hardware FIFO: the maximum is 7 or 15, never 8 or 16. Firmware validates
-index equality to prevent aliasing. FIFO memory is 256-byte aligned and remains
-owned until notification consumption. LSR images require an address below 38 bits.
-The host sizes each FIFO allocation for the instruction stream (Linux uses the
-existing 12-MiB FIFO allocation), and supplies its IOVA in the decode DMA domain.
+Extended entries derive their FIFO index from pp_kick and require it to equal
+the ring index and be less than FIFO slots. The maximum is 7 or 15, never 8 or
+16. FIFO memory is 256-byte aligned, sized for the instruction stream, and
+remains owned until notification consumption. Linux uses its existing 12-MiB
+FIFO allocation. LSR images require FIFO addresses below 38 bits.
+
+Without the multi-VP flag, reserved metadata words remain zero and the existing
+ABI 1 host configures FIFO registers before submitting. The firmware leaves its
+IOVA/cache/xfer setup intact, enables the selected VP's IRQs and uses the supplied
+single PP kick exactly. Legacy entries retain overall completion order; the
+legacy host is responsible for codec dependencies. Both forms enforce distinct
+live FIFO ownership and the per-image FIFO budget.
+
+The scheduler receives normalized work, including opaque program-source flags;
+it never interprets PIODMA packets or reads program memory. Only the feed
+adapter handles program transport. Low transport flags are rejected until their
+source adapter is present; adding SRAM-direct does not require a new scheduler.
+The multi-VP root capability and separate info block leave words 11..15 of the
+original information block available for that transport's geometry.
 
 Doorbell arrival defines submission order. The host retains descriptors, packet
 buffers and FIFO mappings unchanged until it consumes the matching completion.
 Publishing state=2 alone does not release ownership; the notification can still
 be pending. No tag/index can be recycled while an old notification remains.
 
-Every VP EXEC in the supplied program must already contain the descriptor's
-FIFO index. Firmware copies VP programs unchanged, including start, continuation
+Every VP EXEC in the supplied program must contain the FIFO index encoded
+in pp_kick. Extended clients use the ring index. Firmware copies VP programs unchanged, including start, continuation
 and final END words. It does not scan arbitrary operands for opcode patterns.
 The host writes/synchronizes the packet buffer, writes the complete descriptor
 through SRAM I/O accessors, issues a write barrier and state readback, then
