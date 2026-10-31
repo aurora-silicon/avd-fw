@@ -26,7 +26,8 @@ information block at SRAM `+0x7fc0` before raising the existing boot-ready flag:
 | 0x1c | PIODMA destination header for every packet (use verbatim) |
 | 0x20 | VP register index limit (exclusive), 4 / 9 / 12 |
 | 0x24 | codec mask: bits HEVC=0, H.264=1, VP9=2, AV1=3 |
-| 0x28..0x3c | reserved, zero |
+| 0x28 | hardware FIFO slots: cap frames in flight at min(16, this) |
+| 0x2c..0x3c | reserved, zero |
 
 Read the block after boot-ready. Missing magic means old firmware: use the
 legacy backend, or reject queue mode. An unknown version must not be submitted.
@@ -47,7 +48,15 @@ Current firmware aperture addresses are:
 | v3-t0, v3-t1 | `0x01090000` | `0x40070000` | `0x000c + 4*vp` / `0x0030` |
 | v4-t0 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
 | v5-t0 | `0x01090000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
-| v5-t1, v5-t2 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
+| v5-t1 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
+| v5-t2 (T6040/T6041) | `0x01094000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
+
+The aperture must match the SoC's DT `sram` offset from the AVD base
+(+0x90000 on T6000, T8112 and T8140; +0x92000 on T8132; +0x94000 on T6040),
+because the PIODMA destination header is an address in that space. T6040 must
+load `avd-fw-v5-t2` for queue mode: `avd-fw-v5-t1` would place staged words
+0x2000 bytes low, inside the firmware's private state. Legacy mode does not
+use the aperture, so T6040 legacy decode is unaffected by the image choice.
 
 Firmware image version numbers differ from Linux's hardware revision numbering:
 T8103 uses v2, T6000/T8112 use v3, T8122 uses v4, and T8140/T6040 use v5.
@@ -133,6 +142,12 @@ the four-byte packet header (payload words plus one, times four). For comparison
 Tansy `0x5c11` command fetches 368 bytes: a header plus 91 continuation words.
 It clears stale DONE at `+0x04` before issuing, polls DONE bit 0 without masking interrupts, then
 acknowledges DONE. Polling has a bounded software iteration timeout.
+
+Open hardware question: public notes describe the per-segment header as
+`SIZE_words << 18 | DEST | BIT(0)`, while this ABI advertises a header with
+the size field zero and carries the size only in the command register. If
+device bring-up sees PIODMA timeouts, OR `payload_words << 18` into each
+packet header and record which form the engine accepts.
 
 The engine consumes the destination header and places the payload into SRAM
 `+0x9000`. CM3 writes those words to the selected VP instruction FIFO, using

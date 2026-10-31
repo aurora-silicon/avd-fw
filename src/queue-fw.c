@@ -21,6 +21,9 @@
 #else
 #if AVD_VER == 5 && AVD_TIER == 0
 #define SRAM_APERTURE 0x01090000u
+#elif AVD_VER == 5 && AVD_TIER == 2
+/* T6040/T6041: 0x14000-byte code window, so SRAM starts at +0x94000. */
+#define SRAM_APERTURE 0x01094000u
 #else
 #define SRAM_APERTURE 0x01092000u
 #endif
@@ -35,6 +38,16 @@
 #define Q_PIODMA_BASE 0x40070000u
 #else
 #define Q_PIODMA_BASE 0x41070000u
+#endif
+/*
+ * Independent hardware instruction FIFOs (EXEC bits 7:4).  Public variant
+ * tables give 7 on T8103 and T8140 and 15 on the later tier-1 parts; tier-0
+ * parts we cannot confirm get the conservative 7.
+ */
+#if AVD_TIER == 0
+#define FIFO_SLOTS 7u
+#else
+#define FIFO_SLOTS 15u
 #endif
 #define Q_DMA(off) REG(Q_PIODMA_BASE + (off))
 #define SRAM_ALIAS 0x10000000u
@@ -78,6 +91,7 @@ void avdq_fw_init(void)
 	Q_INFO[7] = avdq_packet_header(SRAM_APERTURE + AVDQ_STAGE_OFFSET);
 	Q_INFO[8] = VP_COUNT;
 	Q_INFO[9] = AVD_VER <= 3 ? 7u : 15u;
+	Q_INFO[10] = FIFO_SLOTS;
 	barrier();
 	Q_INFO[0] = AVDQ_MAGIC;
 }
