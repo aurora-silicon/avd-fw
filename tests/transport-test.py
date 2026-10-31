@@ -51,7 +51,7 @@ class Transport:
         assert self.info[:4] == [0x41565131, 1, 16, 64]
         expected = 0x0108c000 if self.version == 2 else 0x01090000 if self.version == 3 or (self.version == 5 and self.tier == 0) else 0x01094000 if (self.version == 5 and self.tier == 2) else 0x01092000
         assert self.info[4] == expected and self.info[8] == self.vps
-        assert self.info[10] == (7 if self.tier == 0 else 15)
+        assert self.info[10] == (7 if self.version == 2 or (self.version == 5 and self.tier == 0) else 15)
         self.ring = self.info[4] + self.info[5]
 
     def u32(self, addr):

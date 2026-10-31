@@ -41,10 +41,9 @@
 #endif
 /*
  * Independent hardware instruction FIFOs (EXEC bits 7:4).  Public variant
- * tables give 7 on T8103 and T8140 and 15 on the later tier-1 parts; tier-0
- * parts we cannot confirm get the conservative 7.
+ * tables: 7 on T8103 (v2) and T8140 (v5-t0), 15 on every other part.
  */
-#if AVD_TIER == 0
+#if AVD_VER == 2 || (AVD_VER == 5 && AVD_TIER == 0)
 #define FIFO_SLOTS 7u
 #else
 #define FIFO_SLOTS 15u
