@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "irq.h"
+#include "queue-fw.h"
 
 #if AVD_VER == 5
 #define PIODMA_CFG		REG(0x41070000)
@@ -228,18 +229,14 @@ static void tansy_emit_hevc_tail(u32 *cmd)
  * Keep this deliberately HEVC-only: the existing direct FIFO path remains in
  * use for H.264, VP9 and AV1.
  */
-void irq1(void)
+static void tansy_mailbox(u32 token)
 {
-	u32 token = reg_read(CM3_MBOX0_RX);
 	u32 *cmd;
 	u32 *header;
 	u32 work_iova;
 	u32 work_count;
 	u32 vp_slot;
 	u32 i;
-
-	/* Tansy clears mailbox-0 not-empty after consuming every AP command. */
-	reg_write(CM3_MBOX_IRQCLR_0, CM3_MBOX0_NOT_EMPTY);
 
 	if (token < TANSY_CMD_BASE || token > TANSY_CMD_END - TANSY_CMD_SIZE)
 		return;
@@ -393,6 +390,17 @@ timeout:
 }
 #endif
 
+void irq1(void)
+{
+	u32 token = reg_read(CM3_MBOX0_RX);
+	reg_write(CM3_MBOX_IRQCLR_0, CM3_MBOX0_NOT_EMPTY);
+	if (avdq_fw_mailbox(token))
+		return;
+#if AVD_VER == 5
+	tansy_mailbox(token);
+#endif
+}
+
 void irq_handler(void)
 {
 	u32 ipsr;
@@ -484,19 +492,22 @@ static void vpdone(u32 n)
 		TANSY_CMD0[16]++;
 #endif
 	irq_clear(n, DECODE_STATUS_DONE);
-	reg_write(CM3_MBOX1_TX, 0x100 | n);
+	if (!avdq_fw_event(n, DECODE_STATUS_DONE))
+		reg_write(CM3_MBOX1_TX, 0x100 | n);
 }
 
 static void err(u32 n)
 {
 	irq_clear(n, DECODE_STATUS_ERR);
-	reg_write(CM3_MBOX1_TX, n);
+	if (!avdq_fw_event(n, DECODE_STATUS_ERR))
+		reg_write(CM3_MBOX1_TX, n);
 }
 
 static void ppdone(u32 n)
 {
 	irq_clear(n, DECODE_STATUS_DONE);
-	reg_write(CM3_MBOX1_TX, 0x1000);
+	if (!avdq_fw_event(n, DECODE_STATUS_DONE))
+		reg_write(CM3_MBOX1_TX, 0x1000);
 }
 
 #if AVD_VER == 5
@@ -505,6 +516,11 @@ static void full(u32 n)
 	u32 *mask = REG(0x4110015c + n * sizeof(u32));
 	u32 *cmd = tansy_active_cmd[n];
 
+	if (avdq_fw_event(n, DECODE_STATUS_FULL)) {
+		reg_write(mask, reg_read(mask) & ~DECODE_STATUS_FULL);
+		irq_clear(n, DECODE_STATUS_FULL);
+		return;
+	}
 	tansy_full_count[n]++;
 	if (cmd)
 		cmd[6] = (tansy_full_hold[n] ? BIT(31) : 0) |
@@ -670,11 +686,7 @@ irq_unk(133, 11)
 irq_err(134, 11)
 irq_vdone(135, 11)
 
-#if AVD_VER == 5
 IRQ(0) IRQ(2) IRQ(3)
-#else
-IRQ(0) IRQ(1) IRQ(2) IRQ(3)
-#endif
 
 IRQ(4) IRQ(5) IRQ(6) IRQ(7)
 IRQ(8) IRQ(9) IRQ(10) IRQ(11)

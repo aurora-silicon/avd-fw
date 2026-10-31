@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "avd.h"
+#include "queue-fw.h"
 
 extern void _start(void);
 
@@ -152,6 +153,7 @@ void _start(void)
 {
 	/* Tansy explicitly restores the architectural vector base on each boot. */
 	reg_write(CM3_SCB_VTOR, 0);
+	avdq_fw_init();
 	apply_tunables();
 #if AVD_VER == 5
 	apply_piodma_tunables();
@@ -182,6 +184,8 @@ void _start(void)
 
 	reg_write(CM3_BOOT, 1);
 
-	while (1)
-		__asm volatile("wfi");
+	while (1) {
+		if (!avdq_fw_poll())
+			avdq_fw_idle();
+	}
 }

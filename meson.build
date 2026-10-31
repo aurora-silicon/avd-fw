@@ -12,14 +12,14 @@ add_project_link_arguments('-nostdlib', language : 'c')
 # set target for clang build
 if meson.get_compiler('c').get_id() == 'clang'
     add_project_arguments('--target=arm-none-eabi', language : 'c')
-    add_project_link_arguments('--target=arm-none-eabi', language : 'c')
+    add_project_link_arguments(['--target=arm-none-eabi', '-fuse-ld=lld'], language : 'c')
 endif
 
 install_dir = get_option('prefix') / 'lib' / get_option('firmwaredir') / 'apple'
 
 objcopy = find_program('llvm-objcopy')
 
-sources = files(['src/avd.c', 'src/irq.c', 'src/util.c'])
+sources = files(['src/avd.c', 'src/irq.c', 'src/util.c', 'src/queue.c', 'src/queue-fw.c'])
 ld_scripts = files('avd-cm3.ld')
 
 avd_variants = [
@@ -29,6 +29,7 @@ avd_variants = [
     { 'name': 'avd-fw-v4-t0', 'version': '4', 'tier': '0', 'pad': '0x12000'},
     { 'name': 'avd-fw-v5-t0', 'version': '5', 'tier': '0', 'pad': '0x10000'},
     { 'name': 'avd-fw-v5-t1', 'version': '5', 'tier': '1', 'pad': '0x12000'},
+    { 'name': 'avd-fw-v5-t2', 'version': '5', 'tier': '2', 'pad': '0x12000'},
 ]
 
 foreach var : avd_variants
@@ -57,3 +58,8 @@ foreach var : avd_variants
         )
     endif
 endforeach
+
+# Compile and run the same scheduler on the build machine, without ARM/MMIO.
+queue_test = executable('queue-test', ['src/queue.c', 'tests/queue-test.c'],
+    native: true, include_directories: include_directories('src'))
+test('queue', queue_test)
