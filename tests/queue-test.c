@@ -138,16 +138,18 @@ static void pipeline(void)
 	step(&q, &io); step(&q, &io); step(&q, &io);
 	assert(q.frame[0].phase == AVDQ_VP && q.frame[1].phase == AVDQ_VP);
 	assert(io.feeds == 3 && !io.kicks && !io.completions);
-	/* Different VP can finish first; PP runs once at a time. */
+	/* A later VP can finish first; PP still runs in submission order. */
 	avdq_vp_done(&q, 1); step(&q, &io);
-	assert(io.kicks == 1 && io.words[0] == c.pp_kick);
+	assert(!io.kicks && q.frame[2].phase == AVDQ_PP_READY);
 	avdq_vp_done(&q, 0); avdq_vp_done(&q, 0); step(&q, &io);
-	assert(io.kicks == 1 && q.frame[1].phase == AVDQ_PP_READY);
+	assert(io.kicks == 1 && io.words[0] == a.pp_kick);
+	assert(q.frame[1].phase == AVDQ_PP_READY);
 	avdq_pp_done(&q); step(&q, &io);
-	assert(io.kicks == 2 && io.words[1] == a.pp_kick && !io.completions);
+	assert(io.kicks == 2 && io.words[1] == b.pp_kick && io.completions == 1);
 	avdq_pp_done(&q);
 	io.blocked = 1; step(&q, &io);
-	assert(q.count == 3 && !io.completions && io.kicks == 3);
+	assert(q.count == 2 && io.completions == 1 && io.kicks == 3);
+	assert(io.words[2] == c.pp_kick);
 	io.blocked = 0; step(&q, &io);
 	avdq_pp_done(&q); step(&q, &io); step(&q, &io);
 	assert(!q.count && io.completions == 3);

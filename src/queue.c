@@ -118,15 +118,21 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
 	}
 	if (q->halted)
 		return;
-	for (i = 0; i < q->count; i++) {
+	/*
+	 * PP runs strictly in submission order: a picture's PP may read the
+	 * pictures before it, and with several VPs a later VP can finish first.
+	 */
+	for (i = 0; q->pp_active < 0 && i < q->count; i++) {
 		unsigned int idx = q->order[(q->head + i) & 15u];
 		struct avdq_frame *f = &q->frame[idx];
-		if (f->phase == AVDQ_PP_READY && q->pp_active < 0) {
+		if (f->phase == AVDQ_DONE)
+			continue;
+		if (f->phase == AVDQ_PP_READY) {
 			q->pp_active = (int)idx;
 			f->phase = AVDQ_PP;
 			ops->kick(cookie, &f->desc);
-			break;
 		}
+		break;
 	}
 	/* One SRAM staging buffer; preserve program order across chunks. */
 	for (i = 0; i < q->count; i++) {
