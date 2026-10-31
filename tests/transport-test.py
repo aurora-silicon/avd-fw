@@ -44,11 +44,13 @@ class Transport:
         self.stores, self.kicks, self.notifications, self.fetches = [], [], [], []
         self.busy, self.full, self.dma_ticks, self.dma_timeout = False, False, 0, False
         self.clear = set()
+        self.ring_writes = set()
         self.uc.hook_add(UC_HOOK_MEM_READ, self.read)
         self.uc.hook_add(UC_HOOK_MEM_WRITE, self.write)
         self.call("avdq_fw_init")
-        self.info = [self.u32(0x10007fc0 + i * 4) for i in range(11)]
-        assert self.info[:4] == [0x41565131, 1, 16, 64]
+        self.info = [self.u32(0x10007fc0 + i * 4) for i in range(16)]
+        assert self.info[:4] == [0x41565131, 2, 16, 64]
+        assert self.info[11:16] == [3, 0, 0x1800, 0, 0]
         expected = 0x0108c000 if self.version == 2 else 0x01090000 if self.version == 3 or (self.version == 5 and self.tier == 0) else 0x01094000 if (self.version == 5 and self.tier == 2) else 0x01092000
         assert self.info[4] == expected and self.info[8] == self.vps
         assert self.info[10] == (7 if self.version == 2 or (self.version == 5 and self.tier == 0) else 15)
@@ -87,6 +89,8 @@ class Transport:
                 self.put(addr, int(self.dma_ticks == 0))
 
     def write(self, uc, access, addr, size, value, user):
+        if 0x10000000 <= addr < 0x10006000:
+            self.ring_writes.add(addr)  # firmware stores into the host ring
         if addr == self.dma + 0x54:
             source = self.u32(self.dma + 0x4c) | self.u32(self.dma + 0x50) << 32
             header, payload = self.packets[source]
@@ -134,6 +138,70 @@ class Transport:
 
     def result(self, idx):
         return [self.u32(0x10008000 + idx * 64 + off) for off in (0x20, 0x24, 0x28)]
+
+
+RING_WORDS = 0x1800
+
+
+def ring_write(t, start, words):
+    for i, w in enumerate(words):
+        t.put(0x10000000 + 4 * ((start + i) % RING_WORDS), w)
+
+
+def submit_sram(t, idx, tag, start, count, extra=0, cont=0, vp=0):
+    desc = [0x41565131, tag, 0, vp, start & 0xffffffff, 0, count,
+            0x2b000400 | idx << 4, 1, 0, 0, 1, extra, cont, 0, 0]
+    t.uc.mem_write(0x10008000 + idx * 64, struct.pack("<16I", *desc))
+    t.put(0x50010058, t.ring + idx * 64)
+    t.call("irq1")
+
+
+def check_sram(image):
+    t = Transport(image)
+    a = list(range(0x100, 0x100 + 100))
+    b = [0xb0000000 | i for i in range(7000)]  # larger than the ring, wraps
+    ring_write(t, 0, a)
+    t.put(0x10007ffc, len(a))
+    submit_sram(t, 0, 0x50000, 0, len(a), extra=2, cont=0x2b000010)
+    submit_sram(t, 1, 0x50011, len(a), len(b))
+    t.poll(4)
+    assert t.stores == a and t.u32(0x10007ff8) == len(a)
+    # Stream B: the host may only run RING_WORDS ahead of the firmware.
+    wp = len(a)
+    while wp < len(a) + len(b):
+        rp = t.u32(0x10007ff8)
+        n = min(RING_WORDS - (wp - rp), len(a) + len(b) - wp, 1500)
+        ring_write(t, wp, b[wp - len(a):wp - len(a) + n])
+        wp += n
+        t.put(0x10007ffc, wp)
+        t.poll(40)
+    t.full = True
+    t.poll(3)
+    t.full = False
+    t.poll(200)
+    assert t.stores == a + b, (len(t.stores), len(a) + len(b))
+    assert t.u32(0x10007ff8) == len(a) + len(b)
+    assert not t.fetches
+    t.vp_done(); t.poll()
+    assert t.kicks == [0x2b000400, 0x2b000010, 0x2b000010]
+    t.vp_done(); t.poll()
+    t.pp_done(); t.poll()
+    assert t.result(0) == [2, 0, 0x50000] and t.notifications == [0x54530000]
+    t.pp_done(); t.poll()  # stray PP DONE from a multi-kick frame is ignored
+    assert t.kicks[-1] == 0x2b000410
+    t.pp_done(); t.busy = False; t.poll()
+    assert t.result(1) == [2, 0, 0x50011]
+    assert t.notifications == [0x54530000, 0x54530011]
+    assert not t.ring_writes, "firmware wrote into the SRAM ring: %s" % sorted(map(hex, t.ring_writes))
+    # A descriptor whose start disagrees with the ring position is fatal.
+    t.busy = False
+    rp = t.u32(0x10007ff8)
+    ring_write(t, rp, [1, 2])
+    t.put(0x10007ffc, rp + 2)
+    submit_sram(t, 2, 0x60002, rp + 1, 2)
+    t.poll(4); t.busy = False; t.poll(2)
+    assert t.result(2) == [2, 2, 0x60002]
+    print(image.stem + ": SRAM ring, wrap, streaming, multi-kick, stray PP DONE, position check passed", flush=True)
 
 
 def check(image):
@@ -204,5 +272,6 @@ def check(image):
 if __name__ == "__main__":
     for arg in sys.argv[1:]:
         check(pathlib.Path(arg))
+        check_sram(pathlib.Path(arg))
     if len(sys.argv) < 2:
         raise SystemExit("usage: transport-test.py build/avd-fw-*.bin")

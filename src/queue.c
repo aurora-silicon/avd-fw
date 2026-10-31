@@ -4,7 +4,7 @@
 void avdq_init(struct avdq *q)
 {
 	unsigned int i;
-	q->head = q->count = q->halted = 0;
+	q->head = q->count = q->halted = q->stray_pp = 0;
 	q->pp_active = -1;
 	for (i = 0; i < AVDQ_COUNT; i++)
 		q->frame[i].phase = AVDQ_FREE;
@@ -20,11 +20,19 @@ static int valid(const struct avdq_desc *d, unsigned int idx,
 	if (d->magic != AVDQ_MAGIC || (d->tag & 15u) != idx ||
 	    d->state != AVDQ_SUBMITTED || d->codec > AVDQ_AV1 ||
 	    !(codec_mask & (1u << d->codec)) || d->vp_slot >= vp_count ||
-	    !addr || (addr & 3u) || !d->program_words ||
-	    d->program_words > AVDQ_MAX_WORDS ||
-	    addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES || !d->pp_kick)
+	    !d->program_words || d->program_words > AVDQ_MAX_WORDS ||
+	    !d->pp_kick || (d->flags & ~AVDQ_FLAG_SRAM) ||
+	    d->pp_extra > AVDQ_MAX_PP_EXTRA || (d->pp_extra && !d->pp_cont))
 		return 0;
-	for (i = 0; i < 5; i++)
+	if (d->flags & AVDQ_FLAG_SRAM) {
+		/* program_lo is the ring write count at the first word. */
+		if (d->program_hi)
+			return 0;
+	} else if (!addr || (addr & 3u) ||
+		   addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES) {
+		return 0;
+	}
+	for (i = 0; i < 2; i++)
 		if (d->reserved[i])
 			return 0;
 	return 1;
@@ -83,7 +91,12 @@ void avdq_pp_done(struct avdq *q)
 	if (q->halted)
 		return;
 	if (q->pp_active < 0) {
-		avdq_fault(q);
+		/*
+		 * Multi-kick frames may raise more than one PP DONE. The legacy
+		 * host completes on the first and ignores the rest; do the same
+		 * rather than poisoning the queue.
+		 */
+		q->stray_pp++;
 		return;
 	}
 	q->frame[q->pp_active].phase = AVDQ_DONE;
@@ -111,7 +124,7 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
 		if (f->phase == AVDQ_PP_READY && q->pp_active < 0) {
 			q->pp_active = (int)idx;
 			f->phase = AVDQ_PP;
-			ops->kick(cookie, f->desc.pp_kick);
+			ops->kick(cookie, &f->desc);
 			break;
 		}
 	}

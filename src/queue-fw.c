@@ -55,6 +55,13 @@
 		   AVDQ_RING_OFFSET + (i) * AVDQ_DESC_BYTES))
 #define Q_STAGE REG(SRAM_ALIAS + AVDQ_STAGE_OFFSET)
 #define Q_INFO REG(SRAM_ALIAS + 0x7fc0u)
+#define Q_RING_WORD REG(SRAM_ALIAS + AVDQ_SRAM_RING_OFFSET)
+#define Q_INFO_RP 14	/* firmware: ring words consumed */
+#define Q_INFO_WP 15	/* host: ring words written */
+/* Words fed per foreground step before interrupts are serviced again. */
+#define Q_FEED_BATCH 64u
+_Static_assert(AVDQ_SRAM_RING_OFFSET + AVDQ_SRAM_RING_WORDS * 4u <= 0x6000u,
+	       "SRAM ring overlaps queue state");
 
 /* Explicit SRAM placement: no dependency on the legacy uninitialized BSS. */
 struct queue_fw {
@@ -63,6 +70,7 @@ struct queue_fw {
 	volatile unsigned int inbox[AVDQ_COUNT];
 	volatile unsigned int vp_done[12], pp_done, error;
 	unsigned int dma_pending, dma_wait, stage_words, stage_used;
+	unsigned int ring_rp;	/* SRAM ring words consumed (free-running) */
 };
 #define FW ((struct queue_fw *)(SRAM_ALIAS + 0x6000u))
 _Static_assert(sizeof(struct queue_fw) <= 0x1fc0u, "SRAM queue state overlaps ABI");
@@ -91,6 +99,9 @@ void avdq_fw_init(void)
 	Q_INFO[8] = VP_COUNT;
 	Q_INFO[9] = AVD_VER <= 3 ? 7u : 15u;
 	Q_INFO[10] = FIFO_SLOTS;
+	Q_INFO[11] = AVDQ_FEAT_SRAM_RING | AVDQ_FEAT_MULTI_KICK;
+	Q_INFO[12] = AVDQ_SRAM_RING_OFFSET;
+	Q_INFO[13] = AVDQ_SRAM_RING_WORDS;
 	barrier();
 	Q_INFO[0] = AVDQ_MAGIC;
 }
@@ -131,11 +142,51 @@ int avdq_fw_event(unsigned int vp, unsigned int event)
 	return 1;
 }
 
+/*
+ * ABI 2 SRAM ring: the host has already streamed (or is still streaming) the
+ * program into the ring at SRAM +0. Copy up to Q_FEED_BATCH words per step
+ * into the VP FIFO, never past the host's write count or the FIFO capacity.
+ */
+static int feed_sram(struct queue_fw *fw, struct avdq_frame *f)
+{
+	unsigned int max, cur, avail, n;
+	if (!f->pushed && f->desc.program_lo != fw->ring_rp)
+		return -1; /* host and firmware disagree about the ring position */
+	avail = Q_INFO[Q_INFO_WP] - fw->ring_rp;
+	if (avail > AVDQ_SRAM_RING_WORDS)
+		return -1;
+	if (!avail)
+		return 0; /* host is still writing; its watchdog covers a stall */
+	if (avail > f->desc.program_words - f->pushed)
+		avail = f->desc.program_words - f->pushed;
+	if (avail > Q_FEED_BATCH)
+		avail = Q_FEED_BATCH;
+	barrier();
+	for (n = 0; n < avail; n++) {
+		max = reg_read(REG(DECODE_CTRL_BASE + FIFO_MAX + f->desc.vp_slot * 4u));
+		cur = reg_read(REG(DECODE_CTRL_BASE + FIFO_CUR + f->desc.vp_slot * 4u));
+		if (!max || cur >= max)
+			break;
+		reg_write(REG(DECODE_CTRL_BASE + VP_FIFO + f->desc.vp_slot * 4u),
+			  Q_RING_WORD[fw->ring_rp % AVDQ_SRAM_RING_WORDS]);
+		__asm volatile("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop" ::: "memory");
+		fw->ring_rp++;
+		f->pushed++;
+	}
+	if (n) {
+		barrier();
+		Q_INFO[Q_INFO_RP] = fw->ring_rp;
+	}
+	return f->pushed == f->desc.program_words;
+}
+
 static int feed(void *cookie, struct avdq_frame *f)
 {
 	struct queue_fw *fw = cookie;
 	unsigned int words, max, cur;
 	uint64_t addr;
+	if (f->desc.flags & AVDQ_FLAG_SRAM)
+		return feed_sram(fw, f);
 	if (fw->stage_used == fw->stage_words) {
 		if (!fw->dma_pending) {
 			words = f->desc.program_words - f->pushed;
@@ -178,10 +229,14 @@ static int feed(void *cookie, struct avdq_frame *f)
 	return 0;
 }
 
-static void kick(void *cookie, uint32_t word)
+static void kick(void *cookie, const struct avdq_desc *d)
 {
+	unsigned int i;
 	(void)cookie;
-	reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), word);
+	reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), d->pp_kick);
+	/* Same continuation EXEC words the legacy host wrote, one per segment. */
+	for (i = 0; i < d->pp_extra; i++)
+		reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), d->pp_cont);
 }
 
 static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
