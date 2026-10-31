@@ -3,7 +3,7 @@
 #define AVD_FW_QUEUE_H
 #include <stdint.h>
 #include "variant.h"
-#define AVDQ_VERSION 1u
+#define AVDQ_VERSION 2u
 #define AVDQ_MAGIC 0x41565131u
 #define AVDQ_COUNT 16u
 #define AVDQ_DESC_BYTES 64u
@@ -29,7 +29,13 @@ enum avdq_codec { AVDQ_HEVC, AVDQ_H264, AVDQ_VP9, AVDQ_AV1 };
 #define AVDQ_MULTI_VERSION 1u
 #define AVDQ_CAP_MULTI_VP (1u << 31)
 #define AVDQ_FLAG_MULTI_VP (1u << 31)
-#define AVDQ_TRANSPORT_FLAGS 0u /* Program-source adapters extend this mask. */
+#define AVDQ_FLAG_SRAM 1u
+#define AVDQ_TRANSPORT_FLAGS AVDQ_FLAG_SRAM
+#define AVDQ_FEAT_SRAM_RING 1u
+#define AVDQ_FEAT_MULTI_KICK 2u
+#define AVDQ_SRAM_RING_OFFSET 0u
+#define AVDQ_SRAM_RING_WORDS 0x1000u /* Power of two: u32 rollover preserves ring indices. */
+#define AVDQ_MAX_PP_EXTRA 255u
 #define AVDQ_CONTEXT_MASK 0x3ffu
 #define AVDQ_CONTEXT_DEP (1u << 31)
 
@@ -37,14 +43,18 @@ enum avdq_codec { AVDQ_HEVC, AVDQ_H264, AVDQ_VP9, AVDQ_AV1 };
 struct avdq_desc {
 	uint32_t magic, tag, codec, vp_slot;
 	uint32_t program_lo, program_hi, program_words, pp_kick;
-	uint32_t state, status, completion_tag, reserved[5];
+	uint32_t state, status, completion_tag;
+	union {
+		uint32_t reserved[5]; /* Multi-VP metadata view, original offsets. */
+		struct { uint32_t flags, pp_extra, pp_cont, tail[2]; };
+	};
 };
 /* Normalized work is independent of the wire extension and program source. */
 struct avdq_work {
 	uint32_t magic, tag, codec, fifo;
 	uint32_t program_lo, program_hi, program_words, num_segments;
 	uint32_t state, status, completion_tag, context, dependency;
-	uint32_t fifo_lo, fifo_hi, pp_kick, extended, flags;
+	uint32_t fifo_lo, fifo_hi, pp_kick, pp_cont, extended, flags;
 };
 _Static_assert(sizeof(struct avdq_desc) == AVDQ_DESC_BYTES, "wire size");
 static inline uint32_t avdq_packet_header(uint32_t dst)
@@ -72,11 +82,11 @@ enum avdq_phase { AVDQ_FREE, AVDQ_PENDING, AVDQ_PUSH, AVDQ_VP,
 struct avdq_frame {
 	struct avdq_desc desc; /* Original record for program-source adapters. */
 	struct avdq_work work; /* Normalized scheduling and FIFO ownership. */
-	uint32_t phase, pushed, status, vp;
+	uint32_t phase, pushed, status, vp, configured;
 };
 struct avdq {
 	struct avdq_frame frame[AVDQ_COUNT];
-	uint32_t order[AVDQ_COUNT], count, halted, next_vp[4];
+	uint32_t order[AVDQ_COUNT], count, halted, next_vp[4], stray_pp;
 	int pp_active;
 	const struct avdq_variant *variant;
 };
@@ -85,6 +95,8 @@ struct avdq_ops {
 	int (*feed)(void *cookie, struct avdq_frame *f);
 	void (*kick)(void *cookie, uint32_t word);
 	int (*complete)(void *cookie, unsigned int idx, const struct avdq_frame *f);
+	/* 1 source is ready, 0 wait, -1 invalid source ordering. */
+	int (*ready)(void *cookie, const struct avdq_frame *f);
 };
 void avdq_init(struct avdq *q, const struct avdq_variant *variant);
 int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d);

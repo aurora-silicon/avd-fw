@@ -55,6 +55,10 @@
 		   AVDQ_RING_OFFSET + (i) * AVDQ_DESC_BYTES))
 #define Q_STAGE REG(SRAM_ALIAS + AVDQ_STAGE_OFFSET)
 #define Q_INFO REG(SRAM_ALIAS + 0x7fc0u)
+#define Q_INFO_RP 14u
+#define Q_INFO_WP 15u
+#define Q_RING_WORD REG(SRAM_ALIAS + AVDQ_SRAM_RING_OFFSET)
+#define Q_FEED_BATCH 64u
 #define Q_MULTI_INFO REG(SRAM_ALIAS + AVDQ_MULTI_INFO_OFFSET)
 
 /* Explicit SRAM placement: no dependency on the legacy uninitialized BSS. */
@@ -65,6 +69,7 @@ struct queue_fw {
 	volatile unsigned int vp_done[12], pp_done, error, vp_ready, fifo_wait;
 	unsigned int runnable;
 	unsigned int dma_pending, dma_wait, stage_words, stage_used;
+	unsigned int ring_rp, source_mode;
 };
 #define FW ((struct queue_fw *)(SRAM_ALIAS + 0x6000u))
 _Static_assert(sizeof(struct queue_fw) <= 0x1f80u, "SRAM queue state overlaps ABI");
@@ -95,6 +100,9 @@ void avdq_fw_init(void)
 	Q_INFO[8] = VP_COUNT;
 	Q_INFO[9] = (AVD_VER <= 3 ? 7u : 15u) | AVDQ_CAP_MULTI_VP;
 	Q_INFO[10] = FIFO_SLOTS;
+	Q_INFO[11] = AVDQ_FEAT_SRAM_RING | AVDQ_FEAT_MULTI_KICK;
+	Q_INFO[12] = AVDQ_SRAM_RING_OFFSET;
+	Q_INFO[13] = AVDQ_SRAM_RING_WORDS;
 	for (i = 0; i < 4; i++)
 		Q_MULTI_INFO[2 + i] = AVDQ_IMAGE_VARIANT->base[i] |
 			(AVDQ_IMAGE_VARIANT->count[i] << 8);
@@ -200,6 +208,86 @@ static void configure_fifo(const struct avdq_frame *f)
 #endif
 }
 
+/* Source readiness is separate from dependencies and VP availability. */
+static int ready(void *cookie, const struct avdq_frame *f)
+{
+	struct queue_fw *fw = cookie;
+	if (!(f->desc.flags & AVDQ_FLAG_SRAM))
+		return 1;
+	/* A streaming ring owns its words in submission order. */
+	for (unsigned int i = 0; i < fw->q.count; i++) {
+		const struct avdq_frame *old = &fw->q.frame[fw->q.order[i]];
+		if (old->phase == AVDQ_DONE || old->status ||
+		    !(old->desc.flags & AVDQ_FLAG_SRAM) || old->pushed == old->desc.program_words)
+			continue;
+		if (old != f)
+			return 0;
+		return f->desc.program_lo == fw->ring_rp ? 1 : -1;
+	}
+	return -1;
+}
+
+static int capacity_wait(struct queue_fw *fw, const struct avdq_frame *f,
+			 unsigned int max, unsigned int cur)
+{
+	unsigned int bit = 1u << f->vp;
+	if (!max)
+		return -1;
+	if (cur < max)
+		return 0;
+	/* Arm then recheck to close the drain-before-unmask race. */
+	__asm volatile("cpsid i" ::: "memory");
+	fw->vp_ready &= ~bit;
+	fw->fifo_wait |= bit;
+	avdq_fw_full_mask(f->vp, 1);
+	cur = reg_read(REG(DECODE_CTRL_BASE + FIFO_CUR + f->vp * 4u));
+	if (cur < max) {
+		avdq_fw_full_mask(f->vp, 0);
+		fw->fifo_wait &= ~bit;
+		fw->runnable = 1;
+	}
+	__asm volatile("cpsie i" ::: "memory");
+	return 1;
+}
+
+static int feed_sram(struct queue_fw *fw, struct avdq_frame *f)
+{
+	unsigned int avail = Q_INFO[Q_INFO_WP] - fw->ring_rp;
+	unsigned int n;
+	if (avail > AVDQ_SRAM_RING_WORDS)
+		return -1;
+	if (!avail) {
+		/* Publishing WP does not signal an IRQ in ABI 2. Poll only producer data. */
+		fw->runnable = 1;
+		return 0;
+	}
+	if (avail > f->desc.program_words - f->pushed)
+		avail = f->desc.program_words - f->pushed;
+	if (avail > Q_FEED_BATCH)
+		avail = Q_FEED_BATCH;
+	barrier();
+	for (n = 0; n < avail; n++) {
+		unsigned int max = reg_read(REG(DECODE_CTRL_BASE + FIFO_MAX + f->vp * 4u));
+		unsigned int cur = reg_read(REG(DECODE_CTRL_BASE + FIFO_CUR + f->vp * 4u));
+		int wait = capacity_wait(fw, f, max, cur);
+		if (wait < 0)
+			return -1;
+		if (wait)
+			break;
+		reg_write(REG(DECODE_CTRL_BASE + VP_FIFO + f->vp * 4u),
+			  Q_RING_WORD[fw->ring_rp % AVDQ_SRAM_RING_WORDS]);
+		__asm volatile("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop" ::: "memory");
+		fw->ring_rp++;
+		f->pushed++;
+		fw->runnable = 1;
+	}
+	if (n) {
+		barrier();
+		Q_INFO[Q_INFO_RP] = fw->ring_rp;
+	}
+	return f->pushed == f->desc.program_words;
+}
+
 static int feed(void *cookie, struct avdq_frame *f)
 {
 	struct queue_fw *fw = cookie;
@@ -217,10 +305,14 @@ static int feed(void *cookie, struct avdq_frame *f)
 		fw->fifo_wait &= ~bit;
 		__asm volatile("cpsie i" ::: "memory");
 	}
+	if (!f->configured) {
+		configure_fifo(f);
+		f->configured = 1;
+	}
+	if (f->desc.flags & AVDQ_FLAG_SRAM)
+		return feed_sram(fw, f);
 	if (fw->stage_used == fw->stage_words) {
 		if (!fw->dma_pending) {
-			if (!f->pushed)
-				configure_fifo(f);
 			words = f->desc.program_words - f->pushed;
 			if (words > AVDQ_PACKET_WORDS)
 				words = AVDQ_PACKET_WORDS;
@@ -250,23 +342,9 @@ static int feed(void *cookie, struct avdq_frame *f)
 	/* Same per-VP capacity/occupancy registers as Linux's direct FIFO path. */
 	max = reg_read(REG(DECODE_CTRL_BASE + FIFO_MAX + f->vp * 4u));
 	cur = reg_read(REG(DECODE_CTRL_BASE + FIFO_CUR + f->vp * 4u));
-	if (!max)
-		return -1;
-	if (cur >= max) {
-		/* Arm then recheck to close the drain-before-unmask race. */
-		__asm volatile("cpsid i" ::: "memory");
-		fw->vp_ready &= ~bit;
-		fw->fifo_wait |= bit;
-		avdq_fw_full_mask(f->vp, 1);
-		cur = reg_read(REG(DECODE_CTRL_BASE + FIFO_CUR + f->vp * 4u));
-		if (cur < max) {
-			avdq_fw_full_mask(f->vp, 0);
-			fw->fifo_wait &= ~bit;
-			fw->runnable = 1;
-		}
-		__asm volatile("cpsie i" ::: "memory");
-		return 0;
-	}
+	int wait = capacity_wait(fw, f, max, cur);
+	if (wait)
+		return wait < 0 ? -1 : 0;
 	reg_write(REG(DECODE_CTRL_BASE + VP_FIFO + f->vp * 4u),
 		  Q_STAGE[fw->stage_used++]);
 	/* Conservative local store cadence also used by the Tansy HEVC path. */
@@ -303,7 +381,7 @@ static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
 
 int avdq_fw_poll(void)
 {
-	static const struct avdq_ops ops = { feed, kick, complete };
+	static const struct avdq_ops ops = { .feed = feed, .kick = kick, .complete = complete, .ready = ready };
 	unsigned int i, vp_done[12], pp_done, error;
 	FW->runnable = 0;
 	if (!FW->mode)
@@ -339,6 +417,12 @@ int avdq_fw_poll(void)
 		if (avdq_submit(&FW->q, idx, &d)) {
 			FW->fatal = 1;
 			avdq_fault(&FW->q);
+		}
+		if (FW->q.frame[idx].status == AVDQ_OK) {
+			unsigned int mode = d.flags & AVDQ_FLAG_SRAM ? 2u : 1u;
+			if (FW->source_mode && FW->source_mode != mode)
+				avdq_fault(&FW->q);
+			FW->source_mode = mode;
 		}
 		/* Queue mode owns PIODMA; the Tansy transport cannot run concurrently. */
 		reg_write(Q_DMA(0x00), reg_read(Q_DMA(0x00)) & ~1u);

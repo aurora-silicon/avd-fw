@@ -51,19 +51,22 @@ class Transport:
         self.stores, self.kicks, self.notifications, self.fetches = [], [], [], []
         self.busy, self.full, self.dma_ticks, self.dma_timeout = False, False, 0, False
         self.clear = set()
+        self.queue_active = False
         self.level_reads = 0
         self.uc.hook_add(UC_HOOK_MEM_READ, self.read)
         self.uc.hook_add(UC_HOOK_MEM_WRITE, self.write)
         self.call("avdq_fw_init")
         self.info = [self.u32(0x10007fc0 + i * 4) for i in range(16)]
-        assert self.info[:4] == [0x41565131, 1, 16, 64]
+        assert self.info[:4] == [0x41565131, 2, 16, 64]
         expected = 0x0108c000 if self.version == 2 else 0x01090000 if self.version == 3 or (self.version == 5 and self.tier == 0) else 0x01094000 if (self.version == 5 and self.tier == 2) else 0x01092000
         assert self.info[4] == expected and self.info[8] == self.vps
         assert self.info[10] == (7 if self.version == 2 or (self.version == 5 and self.tier == 0) else 15)
         self.multi = [self.u32(0x10007f80 + i * 4) for i in range(7)]
         assert self.info[9] & 0x80000000
         assert self.multi[:2] == [0x41564d31, 1] and self.multi[6] == 0x80000000
-        assert self.info[11:] == [0] * 5  # Reserved for transport extensions.
+        assert self.info[11:] == [3, 0, 0x1000, 0, 0]
+        self.written = 0
+        self.queue_active = False
         self.ring = self.info[4] + self.info[5]
 
     def u32(self, addr):
@@ -100,6 +103,8 @@ class Transport:
                 self.put(addr, int(self.dma_ticks == 0))
 
     def write(self, uc, access, addr, size, value, user):
+        if self.queue_active and 0x10000000 <= addr < 0x10006000:
+            raise AssertionError("firmware wrote into the host-owned SRAM ring")
         if addr == self.dma + 0x54:
             source = self.u32(self.dma + 0x4c) | self.u32(self.dma + 0x50) << 32
             header, payload = self.packets[source]
@@ -128,19 +133,32 @@ class Transport:
             else:
                 self.clear.add(addr)
 
-    def submit(self, idx, tag, words, codec=0, context=0, dep=0, segments=1, extended=True):
+    def submit(self, idx, tag, words, codec=0, context=0, dep=0, segments=1, extended=True, sram=False, start=None, extra=0, cont=0):
         source = 0x100004000 + idx * 0x10000
         for p in range((len(words) + 255) // 256):
             self.packets[source + p * 1028] = (self.info[7], words[p * 256:(p + 1) * 256])
         base = self.multi[2 + codec] & 0xff
         reserved = [0x80000000, context | (dep << 31),
-                    0x1000000 + idx * 0x1000000, 2, segments] if extended else [0] * 5
-        desc = [0x41565131, tag, codec, base, source & 0xffffffff, source >> 32,
+                    0x1000000 + idx * 0x1000000, 2, segments] if extended else [0, extra, cont, 0, 0]
+        if sram:
+            source = self.written if start is None else start
+            reserved[0] |= 1
+        desc = [0x41565131, tag, codec, base, source & 0xffffffff, 0 if sram else source >> 32,
                 len(words), 0x2b000400 | (idx << 4), 1, 0, 0, *reserved]
         self.uc.mem_write(0x10008000 + idx * 64, struct.pack("<16I", *desc))
         # Exercise the actual mailbox IRQ wrapper and interrupt acknowledgement.
         self.put(0x50010058, self.ring + idx * 64)
         self.call("irq1")
+        self.queue_active = True
+
+    def publish(self, words):
+        rp = self.u32(0x10007ff8)
+        used = (self.written - rp) & 0xffffffff
+        assert used + len(words) <= self.info[13]
+        for word in words:
+            self.put(0x10000000 + (self.written % self.info[13]) * 4, word)
+            self.written = (self.written + 1) & 0xffffffff
+        self.put(0x10007ffc, self.written)
 
     def poll(self, n=1):
         for _ in range(n):
@@ -175,6 +193,61 @@ class Transport:
 
     def result(self, idx):
         return [self.u32(0x10008000 + idx * 64 + off) for off in (0x20, 0x24, 0x28)]
+
+
+def check_sram(image):
+    t = Transport(image)
+    t.submit(0, 0xa0000, [11] * 100, context=10, dep=1, sram=True)
+    t.publish([11] * 100)
+    t.submit(1, 0xa0001, [22] * 200, context=20, dep=1, sram=True)
+    t.publish([22] * 200)
+    t.poll(12)
+    assert t.stores == [(0, 11)] * 100 + [(1, 22)] * 200 and not t.fetches
+    t.vp_done(1); t.poll(); t.pp_done(); t.poll()
+    assert t.result(1) == [2, 0, 0xa0001]
+    t.vp_done(0); t.poll(); t.pp_done(); t.busy = False; t.poll()
+    assert t.result(0) == [2, 0, 0xa0000]
+    # A ring larger than one job supports incremental producer refill and wrap.
+    t = Transport(image)
+    words = list(range(7000))
+    t.submit(0, 0xb0000, words, sram=True)
+    sent = 0
+    while sent < len(words):
+        free = t.info[13] - ((t.written - t.u32(0x10007ff8)) & 0xffffffff)
+        n = min(free, len(words) - sent)
+        t.publish(words[sent:sent + n]); sent += n
+        t.poll(40)
+    t.poll(120)
+    assert t.stores == [(0, w) for w in words]
+    assert t.u32(0x10007ff8) == 7000 and not t.fetches
+    # VP pressure waits for FULL rather than repeatedly reading occupancy.
+    t = Transport(image)
+    t.submit(0, 0xc0000, [9] * 128, sram=True); t.publish([9] * 128)
+    t.full = True; t.poll(4); reads = t.level_reads; t.poll(8)
+    assert not t.stores and t.level_reads == reads
+    t.full = False; t.not_full(); t.poll(4)
+    assert t.stores == [(0, 9)] * 128
+    # A later free codec cannot steal the word ring ahead of a blocked codec.
+    t = Transport(image)
+    vp9 = t.multi[4] & 0xff
+    t.submit(0, 0xd0000, [1], codec=2, context=10, sram=True); t.publish([1]); t.poll(4)
+    t.submit(1, 0xd0001, [2], codec=2, context=20, sram=True); t.publish([2])
+    t.submit(2, 0xd0002, [3], codec=0, context=30, sram=True); t.publish([3]); t.poll(8)
+    assert t.stores == [(vp9, 1)]
+    t.vp_done(vp9); t.poll(6)
+    assert t.stores == [(vp9, 1), (vp9, 2), (0, 3)]
+    # Ring position disagreement halts before issuing any VP instruction.
+    t = Transport(image)
+    t.submit(0, 0xe0000, [1], sram=True, start=1); t.poll(4)
+    assert t.result(0) == [2, 2, 0xe0000] and not t.stores
+    # ABI 2 callers without metadata retain their continuation words.
+    t = Transport(image)
+    t.submit(0, 0xf0000, [1, 2, 3], sram=True, extended=False, extra=2, cont=0x2b00000f)
+    t.publish([1, 2, 3]); t.poll(5); t.vp_done(); t.poll()
+    assert t.kicks == [0x2b000400, 0x2b00000f, 0x2b00000f]
+    t.pp_done(); t.poll(); t.busy = False; t.pp_done(); t.poll()
+    assert t.result(0) == [2, 0, 0xf0000]
+    print(image.stem + ": SRAM concurrent contexts, refill/wrap, FULL sleep, ordered source, legacy multi-kick passed", flush=True)
 
 
 def check(image):
@@ -313,5 +386,6 @@ def check(image):
 if __name__ == "__main__":
     for arg in sys.argv[1:]:
         check(pathlib.Path(arg))
+        check_sram(pathlib.Path(arg))
     if len(sys.argv) < 2:
         raise SystemExit("usage: transport-test.py build/avd-fw-*.bin")

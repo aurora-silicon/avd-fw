@@ -4,7 +4,7 @@
 void avdq_init(struct avdq *q, const struct avdq_variant *variant)
 {
 	unsigned int i;
-	q->count = q->halted = 0;
+	q->count = q->halted = q->stray_pp = 0;
 	q->pp_active = -1;
 	q->variant = variant;
 	for (i = 0; i < 4; i++)
@@ -29,6 +29,7 @@ static int normalize(const struct avdq *q, const struct avdq_desc *wire,
 	d->program_words = wire->program_words;
 	d->state = wire->state;
 	d->pp_kick = wire->pp_kick;
+	d->pp_cont = wire->pp_cont;
 	d->flags = wire->reserved[0];
 	d->extended = !!(d->flags & AVDQ_FLAG_MULTI_VP);
 	d->context = 0; /* Legacy ABI 1 publishes in overall submission order. */
@@ -50,20 +51,27 @@ static int normalize(const struct avdq *q, const struct avdq_desc *wire,
 		if (d->fifo != idx)
 			return 0;
 	} else {
-		for (i = 1; i < 5; i++)
-			if (wire->reserved[i])
-				return 0;
+		if (wire->pp_extra > AVDQ_MAX_PP_EXTRA ||
+		    (wire->pp_extra && !wire->pp_cont) || wire->tail[0] || wire->tail[1])
+			return 0;
+		d->num_segments = wire->pp_extra + 1u;
 	}
 	if (d->magic != AVDQ_MAGIC || (d->tag & 15u) != idx ||
 	    d->state != AVDQ_SUBMITTED || d->codec > AVDQ_AV1 ||
 	    !q->variant->count[d->codec] ||
 	    (!d->extended && (wire->vp_slot < q->variant->base[d->codec] ||
 	     wire->vp_slot >= q->variant->base[d->codec] + q->variant->count[d->codec])) ||
-	    d->fifo >= q->variant->fifo_slots || !wire->pp_kick || !addr || (addr & 3u) ||
+	    d->fifo >= q->variant->fifo_slots || !wire->pp_kick ||
 	    !d->program_words || d->program_words > AVDQ_MAX_WORDS ||
-	    addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES ||
 	    !d->num_segments || d->num_segments > d->program_words)
 		return 0;
+	if (d->flags & AVDQ_FLAG_SRAM) {
+		if (wire->program_hi)
+			return 0; /* program_lo is a free-running word position, including zero. */
+	} else if (!addr || (addr & 3u) ||
+		   addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES) {
+		return 0;
+	}
 	/* A FIFO stays owned through PP and notification publication. */
 	for (i = 0; i < q->count; i++) {
 		const struct avdq_frame *other = &q->frame[q->order[i]];
@@ -81,7 +89,7 @@ int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d)
 		return -1;
 	f = &q->frame[idx];
 	f->desc = *d;
-	f->pushed = 0;
+	f->pushed = f->configured = 0;
 	f->vp = AVDQ_VPS;
 	f->status = normalize(q, d, &f->work, idx) ? AVDQ_OK : AVDQ_INVALID;
 	f->phase = f->status ? AVDQ_DONE : AVDQ_PENDING;
@@ -123,7 +131,7 @@ void avdq_pp_done(struct avdq *q)
 	if (q->halted)
 		return;
 	if (q->pp_active < 0) {
-		avdq_fault(q);
+		q->stray_pp++; /* Never retire a frame without a PP owner. */
 		return;
 	}
 	q->frame[q->pp_active].phase = AVDQ_DONE;
@@ -194,7 +202,7 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
 		ops->kick(cookie, f->work.extended ?
 			  word | (1u << q->variant->exec_start) : f->work.pp_kick);
 		for (j = 1; j < f->work.num_segments; j++)
-			ops->kick(cookie, word);
+			ops->kick(cookie, f->work.extended ? word : f->work.pp_cont);
 	}
 	/* A single PIODMA staging buffer must stay with its partially fed frame. */
 	for (i = 0; i < q->count; i++)
@@ -207,6 +215,15 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
 			if (f->phase != AVDQ_PENDING ||
 			    (f->work.dependency == AVDQ_DEP_PREV_DONE && predecessor(q, i, 1)))
 				continue;
+			if (ops->ready) {
+				int ready = ops->ready(cookie, f);
+				if (ready < 0) {
+					avdq_fault(q);
+					return;
+				}
+				if (!ready)
+					continue;
+			}
 			vp = free_vp(q, f->work.codec);
 			if (vp < 0)
 				continue;

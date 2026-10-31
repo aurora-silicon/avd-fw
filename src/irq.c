@@ -487,13 +487,15 @@ void irq_clear(u32 n, u32 status)
 
 static void vpdone(u32 n)
 {
+	irq_clear(n, DECODE_STATUS_DONE);
+	if (avdq_fw_event(n, DECODE_STATUS_DONE))
+		return;
 #if AVD_VER == 5
+	/* Tansy bookkeeping lives in SRAM that queue mode uses as its ring. */
 	if (n == 0)
 		TANSY_CMD0[16]++;
 #endif
-	irq_clear(n, DECODE_STATUS_DONE);
-	if (!avdq_fw_event(n, DECODE_STATUS_DONE))
-		reg_write(CM3_MBOX1_TX, 0x100 | n);
+	reg_write(CM3_MBOX1_TX, 0x100 | n);
 }
 
 static void err(u32 n)

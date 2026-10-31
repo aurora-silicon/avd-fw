@@ -34,7 +34,7 @@ static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
 	io->statuses[io->completions++] = f->status;
 	return 1;
 }
-static const struct avdq_ops ops = { feed, kick, complete };
+static const struct avdq_ops ops = { .feed = feed, .kick = kick, .complete = complete };
 static struct avdq_desc descriptor(unsigned int tag, unsigned int context, unsigned int codec)
 {
 	struct avdq_desc d = {0};
@@ -95,7 +95,7 @@ static void invalid(void)
 		case 9: d.program_words = AVDQ_MAX_WORDS + 1; break;
 		case 10: d.program_lo = 0xfffffffcu; d.program_hi = 0xffffffffu; break;
 		case 11: d.reserved[4] = 0; break;
-		case 12: d.reserved[0] |= 1; break;
+		case 12: d.reserved[0] |= 2; break;
 		case 13: d.reserved[4] = 2; break;
 		case 14: d.reserved[1] |= 1u << 10; break;
 		case 15: d.reserved[2] = d.reserved[3] = 0; break;
@@ -195,7 +195,7 @@ static void caps_errors(void)
 	assert(!q.count);
 	avdq_vp_done(&q, 0); avdq_pp_done(&q);
 	assert(!io.kicks);
-	avdq_init(&q, &avdq_variants[1]); avdq_pp_done(&q); assert(q.halted);
+	avdq_init(&q, &avdq_variants[1]); avdq_pp_done(&q); assert(!q.halted && q.stray_pp == 1);
 	avdq_init(&q, &avdq_variants[1]); avdq_vp_done(&q, 0); assert(q.halted);
 }
 static void wide_pp_count(void)
