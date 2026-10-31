@@ -77,7 +77,7 @@ static void wire(void)
 static void invalid(void)
 {
 	unsigned int n;
-	for (n = 0; n < 15; n++) {
+	for (n = 0; n < 18; n++) {
 		struct avdq q;
 		struct fake io = {0};
 		struct avdq_desc d = descriptor(0x100, 1, AVDQ_HEVC);
@@ -98,6 +98,9 @@ static void invalid(void)
 		case 12: d.reserved[0] |= 1; break;
 		case 13: d.reserved[4] = 2; break;
 		case 14: d.reserved[1] |= 1u << 10; break;
+		case 15: d.reserved[2] = d.reserved[3] = 0; break;
+		case 16: d.reserved[2]++; break;
+		case 17: d.reserved[2] = 0; d.reserved[3] = 64; break;
 		}
 		assert(!avdq_submit(&q, 0, &d));
 		assert(q.frame[0].phase == AVDQ_DONE);

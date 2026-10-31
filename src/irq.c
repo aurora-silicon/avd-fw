@@ -510,6 +510,18 @@ static void ppdone(u32 n)
 		reg_write(CM3_MBOX1_TX, 0x1000);
 }
 
+/* FULL can remain level-asserted; mask it and flush one ACK, never poll it. */
+static void full_ack(u32 n)
+{
+	volatile u32 *status = DECODE_STATUS(n);
+#if AVD_VER == 2
+	reg_write(status, DECODE_STATUS_FULL << (n * 5));
+#else
+	reg_write(status, DECODE_STATUS_FULL);
+#endif
+	(void)reg_read(status);
+}
+
 #if AVD_VER == 5
 static void full(u32 n)
 {
@@ -518,7 +530,7 @@ static void full(u32 n)
 
 	if (avdq_fw_event(n, DECODE_STATUS_FULL)) {
 		avdq_fw_full_mask(n, 0);
-		irq_clear(n, DECODE_STATUS_FULL);
+		full_ack(n);
 		return;
 	}
 	tansy_full_count[n]++;
@@ -603,7 +615,7 @@ static void full(u32 n)
 {
 	if (avdq_fw_event(n, DECODE_STATUS_FULL)) {
 		avdq_fw_full_mask(n, 0);
-		irq_clear(n, DECODE_STATUS_FULL);
+		full_ack(n);
 	}
 }
 #define irq_full(n, idx) irq(n) { full(idx); }

@@ -119,10 +119,14 @@ class Transport:
             assert not self.busy, "unread notification overwritten"
             self.busy = True
             self.notifications.append(value)
-        # irq_clear() writes W1C decode status then waits for the ack.
+        # DONE/error are W1C. FULL may stay level-asserted even after its ACK.
         status = self.decode + (0x4060 if self.version == 2 else 0x124 if self.version == 3 else 0x194)
         if (addr == status if self.version == 2 else status <= addr <= status + self.pp_idx * 4):
-            self.clear.add(addr)
+            full_mask = sum(8 << (vp * 5) for vp in range(4)) if self.version == 2 else 8
+            if value & full_mask:
+                self.clear.discard(addr)
+            else:
+                self.clear.add(addr)
 
     def submit(self, idx, tag, words, codec=0, context=0, dep=0, segments=1, extended=True):
         source = 0x100004000 + idx * 0x10000
@@ -130,7 +134,7 @@ class Transport:
             self.packets[source + p * 1028] = (self.info[7], words[p * 256:(p + 1) * 256])
         base = self.multi[2 + codec] & 0xff
         reserved = [0x80000000, context | (dep << 31),
-                    0x1000000 + idx * 0x1000000, 0, segments] if extended else [0] * 5
+                    0x1000000 + idx * 0x1000000, 2, segments] if extended else [0] * 5
         desc = [0x41565131, tag, codec, base, source & 0xffffffff, source >> 32,
                 len(words), 0x2b000400 | (idx << 4), 1, 0, 0, *reserved]
         self.uc.mem_write(0x10008000 + idx * 64, struct.pack("<16I", *desc))
@@ -192,6 +196,16 @@ def check(image):
     t.poll(550)
     assert t.stores == [(0, w) for w in words] + [(1, 0xfeed)]
     assert len(t.fetches) == 4 and not t.kicks and not t.notifications
+    # Distinct 64-bit FIFO mappings, including v3-t2's non-LSR register form.
+    lo = 0x4068 if t.version == 2 else 0x150 if t.version == 3 else 0x1d0
+    hi = 0x30c if t.version == 3 else 0x20c
+    lsr = t.version == 2 or (t.version == 3 and t.tier < 2)
+    for idx in (0, 1):
+        addr = 0x200000000 + 0x1000000 + idx * 0x1000000
+        assert t.u32(t.decode + lo + idx * 4) == (addr >> 8 if lsr else addr & 0xffffffff)
+        if not lsr:
+            assert t.u32(t.decode + hi + idx * 4) == addr >> 32
+
     start = 0x100 if t.version == 2 else 0x200
     mask = t.info[10]
     # VP1 finishes first. Context20 completion bypasses context10.

@@ -151,7 +151,9 @@ The single SRAM staging buffer stays with a partially fed program. DMA polling
 is bounded; FIFO pressure does not block IRQ handlers. On a full VP queue,
 firmware arms status bit 3 as a not-full interrupt, rechecks occupancy to close
 the drain-before-unmask race, and sleeps. The handler masks/acknowledges FULL
-and wakes the feeder. No occupancy reads occur while waiting for that IRQ.
+and wakes the feeder. FULL may remain level-asserted while masked: its ACK is
+flushed once without waiting for the bit to clear. No occupancy reads occur
+while waiting for that IRQ.
 This register/IRQ behavior still requires validation on each generation.
 
 ## PIODMA packets
