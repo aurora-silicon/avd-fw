@@ -41,15 +41,15 @@ all: build/$(NAME).bin
 clean:
 	rm -rf build/*
 
-build/$(NAME).elf: $(BUILD_OBJS)
-	$(CC) $(CFLAGS) -fuse-ld=lld -T $(LD_SCRIPT) -o $@ $^
+build/$(NAME).elf: $(BUILD_OBJS) $(LD_SCRIPT)
+	$(CC) $(CFLAGS) -fuse-ld=lld -Wl,--defsym=AVD_IMAGE_SIZE=$(PAD) -T $(LD_SCRIPT) -o $@ $(BUILD_OBJS)
 
 # Check flags without changing their timestamp when the command is unchanged.
 # Per-variant objects avoid timestamp races between successive matrix builds.
 FORCE:
 $(FLAGS_FILE): FORCE
 	mkdir -p "$(dir $@)"
-	@printf '%s\n' "$(CC) $(CFLAGS)" | cmp -s $@ - || printf '%s\n' "$(CC) $(CFLAGS)" > $@
+	@printf '%s\n' "$(CC) $(CFLAGS) AVD_IMAGE_SIZE=$(PAD)" | cmp -s $@ - || printf '%s\n' "$(CC) $(CFLAGS) AVD_IMAGE_SIZE=$(PAD)" > $@
 
 build/$(NAME)/%.o: src/%.c $(FLAGS_FILE)
 	mkdir -p "$(dir $@)"

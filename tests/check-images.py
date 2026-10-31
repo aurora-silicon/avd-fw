@@ -12,6 +12,8 @@ for arg in sys.argv[1:]:
     pad = 0xc000 if version == 2 else 0x10000 if version == 3 or (version == 5 and tier == 0) else 0x12000
     data = image.read_bytes()
     assert len(data) == pad, (image, len(data), pad)
+    codecs = b"CODECS:h265,h264,vp9" + (b",av1" if version >= 4 else b"")
+    assert data[-64:] == codecs.ljust(64, b"\0"), (image, "codec manifest")
     sp, reset = struct.unpack_from("<II", data)
     assert sp == 0x10000000 + pad, (image, sp)
     elf = image.with_suffix(".elf")

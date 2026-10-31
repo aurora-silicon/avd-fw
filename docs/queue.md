@@ -27,7 +27,11 @@ Transport selection stays separate from normalized frame work and VP scheduling.
 The v5-t2 engine counts are inferred from the full-size family and require
 silicon validation. The v3-t2 image selects the existing v3t1 tunables used for
 T6020, with non-LSR FIFO addresses. There is no separate public v3t2 tuning
-array. Both Make and Meson build all eight images, including v5t2 tunables.
+array. Both Make and Meson build all eight images, including v5t2 tunables. Each
+image ends in a 64-byte CODECS trailer listing all implemented hardware codecs:
+h265, h264 and vp9, plus av1 on v4/v5. The linker reserves the trailer inside
+the existing padded size. This satisfies the host's explicit h265 capability
+requirement without changing image sizes or initial stack vectors.
 
 ## Discovery
 

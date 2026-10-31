@@ -5,6 +5,15 @@
 
 extern void _start(void);
 
+/* The host discovers implemented codecs from this bounded image trailer. */
+__attribute__((section(".codecs"), used))
+static const char codec_manifest[64] =
+#if AVD_VER <= 3
+	"CODECS:h265,h264,vp9";
+#else
+	"CODECS:h265,h264,vp9,av1";
+#endif
+
 __attribute__((section(".vectors"), used))
 static void (*const vector_table[])(void) = {
 	(void *)SP,
