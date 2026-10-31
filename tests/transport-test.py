@@ -90,7 +90,9 @@ class Transport:
             source = self.u32(self.dma + 0x4c) | self.u32(self.dma + 0x50) << 32
             header, payload = self.packets[source]
             assert header == self.info[7]
-            assert value == ((len(payload) + 1) << 6) | 0x11
+            size_bytes = (value << 2) >> 8  # public emulator command decode
+            assert size_bytes == 4 * (len(payload) + 1)
+            assert value & 0xff == 0x11
             self.fetches.append(source)
             self.uc.mem_write(0x10009000, struct.pack("<" + "I" * len(payload), *payload))
             self.dma_ticks = 3

@@ -40,7 +40,8 @@ static inline uint32_t avdq_packet_header(uint32_t dst)
 
 static inline uint32_t avdq_dma_command(uint32_t words)
 {
-	return ((words + 1u) << 6) | 0x11u;
+	/* Command bits 31:6 encode bytes, including the destination header. */
+	return ((words + 1u) << 8) | 0x11u;
 }
 
 static inline uint32_t avdq_notification(uint32_t tag, unsigned int idx)

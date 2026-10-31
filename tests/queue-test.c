@@ -70,8 +70,12 @@ static void wire(void)
 	assert(avdq_notification(0x12345678u, 8) == 0x54535678u);
 	assert(avdq_notification(0xffffffffu, 15) == 0x5453ffffu);
 	assert(avdq_notification(0xffffffffu, 15) != AVDQ_FATAL);
-	assert(avdq_dma_command(1) == 0x91);
-	assert(avdq_dma_command(256) == 0x4051);
+	assert(avdq_dma_command(1) == 0x211);
+	assert(avdq_dma_command(256) == 0x10111);
+	/* Cross-check byte units against the existing Tansy transport packets. */
+	assert(avdq_dma_command(221) == 0xde11); /* HEADER */
+	assert(avdq_dma_command(11) == 0x0c11); /* WORK */
+	assert(avdq_dma_command(91) == 0x5c11); /* SLICE: 91-word continuation */
 	for (i = 0; i < 0x20000; i += 4) {
 		uint32_t h = avdq_packet_header(i);
 		/* Destination decode from the MIT public emulator. */

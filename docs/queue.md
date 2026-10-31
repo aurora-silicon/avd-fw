@@ -127,9 +127,11 @@ packet[1..256]  = up to 256 instruction words; zero-pad final unused words
 ```
 
 For packet p, firmware fetches from `program_iova + p * 1028`. It writes low/high
-IOVA at PIODMA `+0x4c/+0x50` and starts command `((payload_words + 1) << 6) | 0x11`
-at `+0x54`. The size includes the four-byte packet header. It clears stale DONE
-at `+0x04` before issuing, polls DONE bit 0 without masking interrupts, then
+IOVA at PIODMA `+0x4c/+0x50` and starts command `((payload_words + 1) << 8) | 0x11`
+at `+0x54`. Command bits 31:6 encode the transfer size in **bytes**, including
+the four-byte packet header (payload words plus one, times four). For comparison, the existing
+Tansy `0x5c11` command fetches 368 bytes: a header plus 91 continuation words.
+It clears stale DONE at `+0x04` before issuing, polls DONE bit 0 without masking interrupts, then
 acknowledges DONE. Polling has a bounded software iteration timeout.
 
 The engine consumes the destination header and places the payload into SRAM
