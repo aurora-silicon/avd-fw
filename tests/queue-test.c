@@ -219,6 +219,15 @@ static void legacy_abi_one(void)
 	d.tag++;
 	assert(!avdq_submit(&q, 1, &d));
 	assert(q.frame[1].status == AVDQ_INVALID); /* Duplicate FIFO ownership. */
+	avdq_init(&q, &avdq_variants[1]);
+	memset(&io, 0, sizeof(io));
+	d.tag = 0xffffffffu; /* Legacy ring and hardware FIFO indices may differ. */
+	assert(!avdq_submit(&q, 15, &d));
+	step(&q, &io);
+	avdq_vp_done(&q, 0); step(&q, &io);
+	avdq_pp_done(&q); step(&q, &io);
+	assert(io.tags[0] == 0xffffffffu && !q.count);
+
 }
 int main(void)
 {
