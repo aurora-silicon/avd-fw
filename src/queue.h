@@ -3,6 +3,7 @@
 #define AVD_FW_QUEUE_H
 
 #include <stdint.h>
+#include "pool.h"
 
 #define AVDQ_VERSION 2u
 #define AVDQ_MAGIC 0x41565131u /* AVQ1 */
@@ -28,6 +29,7 @@
 #define AVDQ_FLAG_VP_DONE (1u << 1)
 #define AVDQ_VP_NOTIFY 0x54540000u
 #define AVDQ_FEAT_MULTI_KICK 2u
+#define AVDQ_FEAT_MULTI_VP (1u << 3)
 #define AVDQ_SRAM_RING_OFFSET 0x0u
 #define AVDQ_SRAM_RING_WORDS 0x1800u
 #define AVDQ_MAX_PP_EXTRA 255u
@@ -84,6 +86,7 @@ struct avdq_frame {
 	uint32_t phase, pushed, status, vp_notified;
 };
 struct avdq {
+	const struct avdq_pool *pool;
 	struct avdq_frame frame[AVDQ_COUNT];
 	uint32_t order[AVDQ_COUNT], head, count, halted;
 	int pp_active;
@@ -100,7 +103,7 @@ struct avdq_ops {
 	int (*complete)(void *cookie, unsigned int idx,
 			const struct avdq_frame *f);
 };
-void avdq_init(struct avdq *q);
+void avdq_init(struct avdq *q, const struct avdq_pool *pool);
 int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d,
 	       unsigned int vp_count, unsigned int codec_mask);
 void avdq_fault(struct avdq *q);

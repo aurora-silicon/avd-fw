@@ -90,7 +90,7 @@ static void invalid(void)
 		struct avdq q;
 		struct fake io = {0};
 		struct avdq_desc d = descriptor(0x100, 0);
-		avdq_init(&q);
+		avdq_init(&q, NULL);
 		switch (n) {
 		case 0: d.magic = 0; break;
 		case 1: d.tag++; break;
@@ -120,7 +120,7 @@ static void invalid(void)
 		io.blocked = 0; step(&q, &io);
 		assert(!q.count && io.completions == 1);
 		assert(io.tags[0] == d.tag && io.statuses[0] == AVDQ_INVALID);
-		avdq_init(&q);
+		avdq_init(&q, NULL);
 	}
 }
 static void pipeline(void)
@@ -130,7 +130,7 @@ static void pipeline(void)
 	struct avdq_desc a = descriptor(0x12340000, 0);
 	struct avdq_desc b = descriptor(0x56780001, 1);
 	struct avdq_desc c = descriptor(0xabcd0002, 0);
-	avdq_init(&q);
+	avdq_init(&q, NULL);
 	assert(!avdq_submit(&q, 0, &a, 12, 15));
 	assert(!avdq_submit(&q, 1, &b, 12, 15));
 	assert(!avdq_submit(&q, 2, &c, 12, 15));
@@ -166,7 +166,7 @@ static void vp_ownership(void)
 	for (unsigned int depth = 2; depth <= 15; depth++) {
 		struct avdq q;
 		struct fake io = {0};
-		avdq_init(&q);
+		avdq_init(&q, NULL);
 		for (unsigned int i = 0; i < depth; i++) {
 			struct avdq_desc d = descriptor(0x100 | i, 4);
 			assert(!avdq_submit(&q, i, &d, 12, 15));
@@ -194,7 +194,7 @@ static void wrap_and_full(void)
 	struct avdq q;
 	struct fake io = {0};
 	unsigned int round, i;
-	avdq_init(&q);
+	avdq_init(&q, NULL);
 	for (round = 0; round < 3; round++) {
 		for (i = 0; i < 16; i++) {
 			struct avdq_desc d = descriptor((round << 28) | i, 0);
@@ -219,7 +219,7 @@ static void partial_program(void)
 	struct avdq_desc a = descriptor(0, 0), b = descriptor(1, 1);
 	unsigned int i;
 	a.program_words = 513;
-	avdq_init(&q);
+	avdq_init(&q, NULL);
 	avdq_submit(&q, 0, &a, 12, 15); avdq_submit(&q, 1, &b, 12, 15);
 	io.blocked = 1; step(&q, &io);
 	assert(q.frame[0].pushed == 0 && q.frame[1].phase == AVDQ_PENDING);
@@ -236,7 +236,7 @@ static void arbitrary_indices(void)
 	struct avdq q;
 	struct fake io = {0};
 	struct avdq_desc a = descriptor(0x1007, 0), b = descriptor(0x2003, 0);
-	avdq_init(&q);
+	avdq_init(&q, NULL);
 	assert(!avdq_submit(&q, 7, &a, 12, 15));
 	assert(!avdq_submit(&q, 3, &b, 12, 15));
 	step(&q, &io); step(&q, &io);
@@ -249,7 +249,7 @@ static void errors(void)
 	struct avdq q;
 	struct fake io = {0};
 	struct avdq_desc a = descriptor(0, 0), b = descriptor(1, 1);
-	avdq_init(&q);
+	avdq_init(&q, NULL);
 	avdq_submit(&q, 0, &a, 12, 15); avdq_submit(&q, 1, &b, 12, 15);
 	io.fail = 1; step(&q, &io);
 	assert(q.halted && q.count == 2);
@@ -259,9 +259,9 @@ static void errors(void)
 	avdq_vp_done(&q, 0); avdq_pp_done(&q); /* late events after a fault */
 	assert(!io.kicks);
 	/* A stray PP DONE (multi-kick frames) is counted, not fatal. */
-	avdq_init(&q);
+	avdq_init(&q, NULL);
 	avdq_pp_done(&q); assert(!q.halted && q.stray_pp == 1);
-	avdq_init(&q);
+	avdq_init(&q, NULL);
 	avdq_vp_done(&q, 0); assert(q.halted);
 }
 static void sram_ring(void)
@@ -274,7 +274,7 @@ static void sram_ring(void)
 	d.program_hi = 0;
 	d.pp_extra = 3;
 	d.pp_cont = 0x2b000000u;
-	avdq_init(&q);
+	avdq_init(&q, NULL);
 	assert(!avdq_submit(&q, 0, &d, 12, 15));
 	assert(q.frame[0].phase == AVDQ_PENDING);
 	step(&q, &io);
@@ -286,9 +286,26 @@ static void sram_ring(void)
 	avdq_pp_done(&q); avdq_pp_done(&q); step(&q, &io);
 	assert(!q.halted && q.stray_pp == 2);
 }
+static void pools(void)
+{
+	for (unsigned int variant = 0; variant < sizeof(avdq_pools) / sizeof(avdq_pools[0]); variant++) {
+		const struct avdq_pool *pool = &avdq_pools[variant];
+		uint32_t used = 0;
+		for (unsigned int codec = 0; codec < 4; codec++) {
+			assert(!(used & pool->codec[codec])); used |= pool->codec[codec];
+			for (unsigned int vp = 0; vp < 12; vp++) {
+				struct avdq q; struct avdq_desc d = descriptor(0x100, vp);
+				avdq_init(&q, pool); d.codec = codec;
+				assert(!avdq_submit(&q, 0, &d, 12, 15));
+				assert(q.frame[0].status == ((pool->codec[codec] & (1u << vp)) ? AVDQ_OK : AVDQ_INVALID));
+			}
+		}
+		assert(!(used & ~0xfffu));
+	}
+}
 int main(void)
 {
-	vp_ownership(); wire(); sram_ring(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
+	pools(); vp_ownership(); wire(); sram_ring(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
 	puts("queue: wire, sram ring, validation, pipeline, backpressure, wrap, tags, errors passed");
 	return 0;
 }

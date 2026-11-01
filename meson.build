@@ -26,6 +26,7 @@ avd_variants = [
     { 'name': 'avd-fw-v2-t0', 'version': '2', 'tier': '0', 'pad': '0xc000'},
     { 'name': 'avd-fw-v3-t0', 'version': '3', 'tier': '0', 'pad': '0x10000'},
     { 'name': 'avd-fw-v3-t1', 'version': '3', 'tier': '1', 'pad': '0x10000'},
+    { 'name': 'avd-fw-v3-t2', 'version': '3', 'tier': '2', 'pad': '0x10000'},
     { 'name': 'avd-fw-v4-t0', 'version': '4', 'tier': '0', 'pad': '0x12000'},
     { 'name': 'avd-fw-v5-t0', 'version': '5', 'tier': '0', 'pad': '0x10000'},
     { 'name': 'avd-fw-v5-t1', 'version': '5', 'tier': '1', 'pad': '0x12000'},

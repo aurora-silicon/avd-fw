@@ -27,7 +27,7 @@ information block at SRAM `+0x7fc0` before raising the existing boot-ready flag:
 | 0x20 | VP register index limit (exclusive), 4 / 9 / 12 |
 | 0x24 | codec mask: bits HEVC=0, H.264=1, VP9=2, AV1=3 |
 | 0x28 | hardware FIFO slots: cap frames in flight at min(16, this) |
-| 0x2c | features: bit 0 SRAM ring, bit 1 multi-kick PP |
+| 0x2c | features: bit 0 SRAM ring, bit 1 multi-kick PP, bit 2 VP DONE, bit 3 VP pools |
 | 0x30 | SRAM ring offset, `0x0` |
 | 0x34 | SRAM ring size in words, `0x1800` (24 KiB) |
 | 0x38 | firmware: SRAM ring words consumed (free-running, live) |
@@ -39,7 +39,7 @@ Check count/stride/packet size and the actual SRAM resource length. Use the
 advertised address instead of deriving it from the host physical address.
 
 The ring occupies `+0x8000..+0x83ff`. Firmware private state is at
-`+0x6000..+0x7fbf`, and its 1024-byte PIODMA staging buffer is at `+0x9000`.
+`+0x6000..+0x7f7f`, and its 1024-byte PIODMA staging buffer is at `+0x9000`.
 The minimum SRAM size supported by the existing images is `0xc000`. The stack
 stays at the existing per-image SRAM end. Do not use these regions for codec
 scratch or legacy commands in queue mode.
@@ -49,7 +49,7 @@ Current firmware aperture addresses are:
 | Image | SRAM address | PIODMA CM3 base | VP FIFO / PP FIFO offset from decode base |
 | --- | --- | --- | --- |
 | v2-t0 | `0x0108c000` | `0x40070000` | `0x4004 + 4*vp` / `0x4014` |
-| v3-t0, v3-t1 | `0x01090000` | `0x40070000` | `0x000c + 4*vp` / `0x0030` |
+| v3-t0, v3-t1, v3-t2 | `0x01090000` | `0x40070000` | `0x000c + 4*vp` / `0x0030` |
 | v4-t0 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
 | v5-t0 | `0x01090000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
 | v5-t1 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
@@ -76,7 +76,7 @@ Each descriptor is exactly 16 u32 words (`struct avdq_desc` in `src/queue.h`):
 | 0x00 | magic | host: `0x41565131` |
 | 0x04 | tag | host: full u32 `(sequence << 4) | ring_index` |
 | 0x08 | codec | host: HEVC=0, H.264=1, VP9=2, AV1=3 |
-| 0x0c | vp_slot | host: hardware VP index from SoC codec match data |
+| 0x0c | vp_slot | host: hardware VP index from the advertised pool or SoC match data |
 | 0x10 | program_lo | host: low 32 bits of packet-buffer PIODMA IOVA |
 | 0x14 | program_hi | host: high 32 bits of that IOVA |
 | 0x18 | program_words | host: instruction words, excludes packet headers/padding |
@@ -339,3 +339,63 @@ the earlier picture is PP-ready or running PP. Independent VPs can still run
 concurrently. A blocked program cannot be skipped because the SRAM word ring is
 in global submission order. The host watchdog continues to bound a missing
 DONE; errors halt all accepted work as before.
+
+## Optional codec VP pools (ABI 2 feature bit 3)
+
+`avd/multi-vp-2` retains the ABI 2 SRAM ring and tagged VP DONE feature from
+`bf49a31b`. It ports the per-image codec pools from the earlier MIT multi-VP
+implementation without changing descriptor offsets or restoring its older
+transport. No AVM1 descriptor extension is accepted or required.
+
+When info word 11 has bit 3, SRAM +0x7f80 contains eight little-endian u32 words:
+
+| Word | Meaning |
+| --- | --- |
+| 0 | `0x41564d32` (AVM2), published before the main info magic |
+| 1 | Pool record version, 1 |
+| 2..5 | HEVC, H.264, VP9, AV1 masks; bit n names hardware VP n |
+| 6 | Bit n means codec n's pool count is inferred |
+| 7 | Reserved, zero |
+
+The masks must be disjoint, fit the VP register limit in info word 8 and agree
+with info word 9's codec mask. Firmware validates every descriptor's codec/VP
+pair against the same pool used to publish the record, including tier-0 holes.
+Older hosts continue to submit the first VP of each codec with unchanged ABI 2
+descriptors. New hosts use one VP per codec unless feature bit 3 and a valid
+pool record are both present.
+
+| Image | HEVC VPs | H.264 VPs | VP9 VPs | AV1 VPs |
+| --- | --- | --- | --- | --- |
+| v2-t0 (T8103) | 0..1 | 2 | 3 | none |
+| v3-t0 (T6000) | 0..3 | 4..7 | 8 | none |
+| v3-t1 (T8112) | 0..3 | 4..7 | 8 | none |
+| v3-t2 (T6020) | 0..3 | 4..7 | 8 | none |
+| v4-t0 (T8122) | 0..3 | 4..7 | 8 | 9..10 |
+| v5-t0 (T8140) | 0..1 | 4 | 8 | 9 |
+| v5-t1 (T8132) | 0..3 | 4..7 | 8 | 9..11 |
+| v5-t2 (T6040) | 0..3 | 4..7 | 8 | 9..11 |
+
+The T6040 row is inferred from the T8132 pool, not measured on silicon; its
+inferred mask is 15. Other rows follow the public codec variant tables already
+used by `avd/multi-vp`. The non-LSR T6020 image reuses the v3-t1 tunable set,
+as in that earlier implementation. This image association still needs device
+qualification. No register probing or guessed engine counts are needed in the
+host driver.
+
+SRAM programs remain globally ordered and a VP owns its picture state until
+that engine's DONE. Different VPs may execute simultaneously, but PP always
+starts in descriptor submission order, including when later VPs finish first.
+Each frame keeps a distinct instruction FIFO and its buffers until the full
+PP completion. Tagged VP notifications and their outbox backpressure work
+independently for each engine; they do not release a FIFO or descriptor.
+H.264/HEVC VP work reads the picture's bitstream and private slice/scratch state;
+reference reconstruction is consumed by ordered PP. VP9/AV1 host dependency
+checks remain necessary: selecting another VP cannot satisfy a CPU probability,
+CDF or segmentation input dependency.
+
+`make test` checks every pool pair plus the scheduler ownership cases.
+`sh tests/build-all.sh` builds all eight images. Run
+`python3 tests/transport-test.py build/avd-fw-*.bin` with Unicorn to exercise
+all image pools, reverse VP completion, per-engine tagged VP events, ordered PP,
+outbox stalls, codec/engine rejection, SRAM streaming and legacy PIODMA.
+These tests model completion events and do not decode pixels or measure speed.

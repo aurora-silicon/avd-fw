@@ -42,6 +42,7 @@ class Transport:
         self.pp_idx = 4 if self.version == 2 else 9 if self.version == 3 else 13
         self.packets = {}
         self.stores, self.kicks, self.notifications, self.fetches = [], [], [], []
+        self.engine_stores = []
         self.busy, self.full, self.dma_ticks, self.dma_timeout = False, False, 0, False
         self.clear = set()
         self.ring_writes = set()
@@ -50,11 +51,17 @@ class Transport:
         self.call("avdq_fw_init")
         self.info = [self.u32(0x10007fc0 + i * 4) for i in range(16)]
         assert self.info[:4] == [0x41565131, 2, 16, 64]
-        assert self.info[11:16] == [7, 0, 0x1800, 0, 0]
+        assert self.info[11:16] == [15, 0, 0x1800, 0, 0]
         expected = 0x0108c000 if self.version == 2 else 0x01090000 if self.version == 3 or (self.version == 5 and self.tier == 0) else 0x01094000 if (self.version == 5 and self.tier == 2) else 0x01092000
         assert self.info[4] == expected and self.info[8] == self.vps
         assert self.info[10] == (7 if self.version == 2 or (self.version == 5 and self.tier == 0) else 15)
         self.ring = self.info[4] + self.info[5]
+        pool = [self.u32(0x10007f80 + i * 4) for i in range(8)]
+        assert pool[:2] == [0x41564d32, 1] and pool[7] == 0
+        self.pool = pool[2:6]
+        assert pool[6] == (15 if (self.version, self.tier) == (5, 2) else 0)
+        expected_pool = [3, 4, 8, 0] if self.version == 2 else [15, 240, 256, 0] if self.version == 3 else [15, 240, 256, 1536] if self.version == 4 else [3, 16, 256, 512] if self.tier == 0 else [15, 240, 256, 3584]
+        assert self.pool == expected_pool
 
     def u32(self, addr):
         return struct.unpack("<I", self.uc.mem_read(addr, 4))[0]
@@ -104,6 +111,7 @@ class Transport:
             self.put(self.dma + 4, 0)
         if self.decode + self.fifo <= addr < self.decode + self.fifo + self.vps * 4:
             self.stores.append(value)
+            self.engine_stores.append(((addr - self.decode - self.fifo) // 4, value))
         if addr == self.decode + self.pp:
             self.kicks.append(value)
         if addr == 0x50010060:
@@ -148,9 +156,9 @@ def ring_write(t, start, words):
         t.put(0x10000000 + 4 * ((start + i) % RING_WORDS), w)
 
 
-def submit_sram(t, idx, tag, start, count, extra=0, cont=0, vp=0):
-    desc = [0x41565131, tag, 0, vp, start & 0xffffffff, 0, count,
-            0x2b000400 | idx << 4, 1, 0, 0, 1, extra, cont, 0, 0]
+def submit_sram(t, idx, tag, start, count, extra=0, cont=0, vp=0, codec=0, flags=1):
+    desc = [0x41565131, tag, codec, vp, start & 0xffffffff, 0, count,
+            0x2b000400 | idx << 4, 1, 0, 0, flags, extra, cont, 0, 0]
     t.uc.mem_write(0x10008000 + idx * 64, struct.pack("<16I", *desc))
     t.put(0x50010058, t.ring + idx * 64)
     t.call("irq1")
@@ -271,9 +279,65 @@ def check(image):
     print(image.stem + ": legacy IRQs, 64-bit PIODMA, packets, FIFO pressure, VP->PP, outbox, tags, error/reset passed", flush=True)
 
 
+def check_multi(image):
+    # Every engine of every supported codec, with reverse-order VP DONE.
+    for codec in range(4):
+        t = Transport(image)
+        engines = [vp for vp in range(t.vps) if t.pool[codec] & (1 << vp)]
+        if not engines:
+            continue
+        for idx, vp in enumerate(engines):
+            ring_write(t, idx, [0xc0000000 | idx])
+            submit_sram(t, idx, 0xa0000 | idx, idx, 1, vp=vp, codec=codec, flags=3)
+        t.put(0x10007ffc, len(engines))
+        t.poll(20)
+        assert t.engine_stores == [(vp, 0xc0000000 | idx) for idx, vp in enumerate(engines)]
+        assert not t.kicks and not t.notifications
+        # Hold the outbox while all engine IRQs arrive. Check both routers.
+        t.busy = True
+        for idx in reversed(range(len(engines))):
+            vp = engines[idx]
+            irq = (18 if t.version == 2 else 78) + 5 * vp + 2
+            bank, bit = divmod(irq - 14, 32)
+            assert t.u32(0x50010014 + bank * 4) & (1 << bit)
+            t.call('irq' + str(irq))
+            t.poll()
+            assert t.result(idx)[0] == 1
+            if idx:
+                assert not t.kicks, 'PP bypassed an earlier VP'
+        assert not t.notifications
+        # Drain one tagged VP event per engine without releasing its descriptor.
+        for _ in engines:
+            t.busy = False
+            t.poll()
+        assert t.notifications == [0x54540000 | idx for idx in range(len(engines))]
+        for idx in range(len(engines)):
+            assert t.u32(0x10008038 + idx * 64) == (0xa0000 | idx)
+            assert t.u32(0x1000803c + idx * 64) == 1
+            assert t.result(idx)[0] == 1
+        # PP and full completions stay submission ordered, even with outbox stalls.
+        for idx in range(len(engines)):
+            assert len(t.kicks) == idx + 1
+            assert t.kicks[idx] == 0x2b000400 | idx << 4
+            t.pp_done(); t.poll()
+            assert t.result(idx)[0] == 1
+            t.busy = False; t.poll()
+            assert t.result(idx) == [2, 0, 0xa0000 | idx]
+        assert t.notifications[len(engines):] == [0x54530000 | idx for idx in range(len(engines))]
+    # Reject a codec/engine mismatch, including a tier-0 hole, before feeding.
+    t = Transport(image)
+    bad = next(vp for vp in range(t.vps) if not t.pool[1] & (1 << vp))
+    ring_write(t, 0, [1]); t.put(0x10007ffc, 1)
+    submit_sram(t, 0, 0x10000, 0, 1, vp=bad, codec=1)
+    t.poll(4)
+    assert not t.stores and t.result(0) == [2, 1, 0x10000]
+    print(image.stem + ': every codec VP, reverse VP DONE, tagged per-engine events, ordered PP, outbox stalls and pool rejection passed', flush=True)
+
+
 if __name__ == "__main__":
     for arg in sys.argv[1:]:
         check(pathlib.Path(arg))
         check_sram(pathlib.Path(arg))
+        check_multi(pathlib.Path(arg))
     if len(sys.argv) < 2:
         raise SystemExit("usage: transport-test.py build/avd-fw-*.bin")
