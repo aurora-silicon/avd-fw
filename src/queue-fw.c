@@ -99,7 +99,8 @@ void avdq_fw_init(void)
 	Q_INFO[8] = VP_COUNT;
 	Q_INFO[9] = AVD_VER <= 3 ? 7u : 15u;
 	Q_INFO[10] = FIFO_SLOTS;
-	Q_INFO[11] = AVDQ_FEAT_SRAM_RING | AVDQ_FEAT_MULTI_KICK;
+	Q_INFO[11] = AVDQ_FEAT_SRAM_RING | AVDQ_FEAT_MULTI_KICK |
+		     AVDQ_FEAT_VP_DONE;
 	Q_INFO[12] = AVDQ_SRAM_RING_OFFSET;
 	Q_INFO[13] = AVDQ_SRAM_RING_WORDS;
 	barrier();
@@ -266,6 +267,32 @@ static void kick(void *cookie, const struct avdq_desc *d)
 		reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), d->pp_cont);
 }
 
+/* VP records do not release any descriptor or DMA storage. */
+static void notify_vp(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < FW->q.count; i++) {
+		unsigned int idx = FW->q.order[(FW->q.head + i) & 15u];
+		struct avdq_frame *f = &FW->q.frame[idx];
+		volatile struct avdq_desc *d = Q_DESC(idx);
+
+		if (!(f->desc.flags & AVDQ_FLAG_VP_DONE) || f->vp_notified ||
+		    f->status || (f->phase != AVDQ_PP_READY &&
+		    f->phase != AVDQ_PP && f->phase != AVDQ_DONE))
+			continue;
+		if (!(reg_read(CM3_MBOX1_STATUS) & CM3_MBOX_STATUS_EMPTY))
+			return;
+		d->reserved[0] = f->desc.tag;
+		barrier();
+		d->reserved[1] = 1;
+		barrier();
+		reg_write(CM3_MBOX1_TX, AVDQ_VP_NOTIFY | (f->desc.tag & 0xfff0u) | idx);
+		f->vp_notified = 1;
+		return;
+	}
+}
+
 static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
 {
 	volatile struct avdq_desc *d = Q_DESC(idx);
@@ -323,6 +350,7 @@ int avdq_fw_poll(void)
 		/* Queue mode owns PIODMA; the Tansy transport cannot run concurrently. */
 		reg_write(Q_DMA(0x00), reg_read(Q_DMA(0x00)) & ~1u);
 	}
+	notify_vp();
 	avdq_step(&FW->q, &ops, FW);
 	if (FW->fatal && !FW->q.count &&
 	    (reg_read(CM3_MBOX1_STATUS) & CM3_MBOX_STATUS_EMPTY)) {

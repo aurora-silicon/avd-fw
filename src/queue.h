@@ -24,6 +24,9 @@
  */
 #define AVDQ_FLAG_SRAM 1u
 #define AVDQ_FEAT_SRAM_RING 1u
+#define AVDQ_FEAT_VP_DONE (1u << 2)
+#define AVDQ_FLAG_VP_DONE (1u << 1)
+#define AVDQ_VP_NOTIFY 0x54540000u
 #define AVDQ_FEAT_MULTI_KICK 2u
 #define AVDQ_SRAM_RING_OFFSET 0x0u
 #define AVDQ_SRAM_RING_WORDS 0x1800u
@@ -78,7 +81,7 @@ enum avdq_phase { AVDQ_FREE, AVDQ_PENDING, AVDQ_PUSH, AVDQ_VP,
 	AVDQ_PP_READY, AVDQ_PP, AVDQ_DONE };
 struct avdq_frame {
 	struct avdq_desc desc;
-	uint32_t phase, pushed, status;
+	uint32_t phase, pushed, status, vp_notified;
 };
 struct avdq {
 	struct avdq_frame frame[AVDQ_COUNT];

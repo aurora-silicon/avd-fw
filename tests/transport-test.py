@@ -50,7 +50,7 @@ class Transport:
         self.call("avdq_fw_init")
         self.info = [self.u32(0x10007fc0 + i * 4) for i in range(16)]
         assert self.info[:4] == [0x41565131, 2, 16, 64]
-        assert self.info[11:16] == [3, 0, 0x1800, 0, 0]
+        assert self.info[11:16] == [7, 0, 0x1800, 0, 0]
         expected = 0x0108c000 if self.version == 2 else 0x01090000 if self.version == 3 or (self.version == 5 and self.tier == 0) else 0x01094000 if (self.version == 5 and self.tier == 2) else 0x01092000
         assert self.info[4] == expected and self.info[8] == self.vps
         assert self.info[10] == (7 if self.version == 2 or (self.version == 5 and self.tier == 0) else 15)

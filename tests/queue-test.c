@@ -105,7 +105,7 @@ static void invalid(void)
 		case 10: d.program_lo = 0xfffffffcu; d.program_hi = 0xffffffffu; break;
 		case 11: d.pp_kick = 0; break;
 		case 12: d.reserved[1] = 1; break;
-		case 13: d.flags = 2; break;
+		case 13: d.flags = 4; break;
 		case 14: d.pp_extra = AVDQ_MAX_PP_EXTRA + 1; d.pp_cont = 1; break;
 		case 15: d.pp_extra = 1; break; /* continuation word missing */
 		case 16: d.flags = AVDQ_FLAG_SRAM; break; /* program_hi must be 0 */

@@ -21,7 +21,7 @@ static int valid(const struct avdq_desc *d, unsigned int idx,
 	    d->state != AVDQ_SUBMITTED || d->codec > AVDQ_AV1 ||
 	    !(codec_mask & (1u << d->codec)) || d->vp_slot >= vp_count ||
 	    !d->program_words || d->program_words > AVDQ_MAX_WORDS ||
-	    !d->pp_kick || (d->flags & ~AVDQ_FLAG_SRAM) ||
+	    !d->pp_kick || (d->flags & ~(AVDQ_FLAG_SRAM | AVDQ_FLAG_VP_DONE)) ||
 	    d->pp_extra > AVDQ_MAX_PP_EXTRA || (d->pp_extra && !d->pp_cont))
 		return 0;
 	if (d->flags & AVDQ_FLAG_SRAM) {
@@ -49,6 +49,7 @@ int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d,
 	f = &q->frame[idx];
 	f->desc = *d;
 	f->pushed = 0;
+	f->vp_notified = 0;
 	f->status = valid(d, idx, vp_count, codec_mask) ? AVDQ_OK : AVDQ_INVALID;
 	f->phase = f->status ? AVDQ_DONE : AVDQ_PENDING;
 	q->order[(q->head + q->count) & (AVDQ_COUNT - 1)] = idx;
