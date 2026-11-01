@@ -276,13 +276,19 @@ lead's device tests. No hardware was requested for this change.
 Requirements: Clang with the ARM bare-metal target, LLD, llvm-objcopy, a native C
 compiler, Meson >=1.4, Ninja. Keep LLVM/LLD tools on PATH.
 
+The Makefile and Meson (with `llvm.ini` and its default options) build the same
+images byte for byte. Do not pass `--buildtype` or `-Doptimization` to Meson,
+and do not let a distribution inject its own CFLAGS: either changes the code.
+`arm-none-eabi-gcc.ini` is a GCC alternative and produces different images.
+
 ```sh
 make test
 sh tests/build-all.sh
 python3 tests/check-images.py build/avd-fw-*.bin
-meson setup build/meson --cross-file llvm.ini --buildtype=release
+meson setup build/meson --cross-file llvm.ini
 meson compile -C build/meson
 meson test -C build/meson --print-errorlogs
+sh tests/check-reproducible.sh   # Make and Meson images must be byte-identical
 
 # Optional integration test of actual ARM machine code, with synthetic MMIO:
 python3 -m venv build/test-venv
