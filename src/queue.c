@@ -137,9 +137,24 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
 	/* One SRAM staging buffer; preserve program order across chunks. */
 	for (i = 0; i < q->count; i++) {
 		struct avdq_frame *f = &q->frame[q->order[(q->head + i) & 15u]];
+		unsigned int j;
 		int result;
 		if (f->phase != AVDQ_PENDING && f->phase != AVDQ_PUSH)
 			continue;
+		/*
+		 * FIFO space is not picture completion. A VP still owns its live
+		 * picture state after the last word is fed, until its DONE event.
+		 * Its successor may overlap PP, but must not start on that VP yet.
+		 * Do not skip a blocked program: SRAM words are globally ordered.
+		 */
+		for (j = 0; j < i; j++) {
+			struct avdq_frame *prev =
+				&q->frame[q->order[(q->head + j) & 15u]];
+
+			if (prev->phase == AVDQ_VP &&
+			    prev->desc.vp_slot == f->desc.vp_slot)
+				return;
+		}
 		f->phase = AVDQ_PUSH;
 		result = ops->feed(cookie, f);
 		if (result < 0)

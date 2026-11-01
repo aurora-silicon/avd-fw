@@ -328,3 +328,14 @@ the input or output format. Use the existing core's trace/debug instrumentation
 to record maximum in-flight count and tag correlation; ABI 1 adds no queue-depth
 module parameter. To measure steady-state decode independently of output disk
 I/O, repeat the hardware decode with `-benchmark -f null -` as the output.
+
+### VP picture ownership
+
+A fully fed program still owns its VP until that VP's DONE event. FIFO capacity
+only permits more words; it does not release the VP's live picture state.
+The foreground scheduler therefore leaves a successor pending when an earlier
+frame on the same VP is in `AVDQ_VP`. After DONE it can feed the successor while
+the earlier picture is PP-ready or running PP. Independent VPs can still run
+concurrently. A blocked program cannot be skipped because the SRAM word ring is
+in global submission order. The host watchdog continues to bound a missing
+DONE; errors halt all accepted work as before.

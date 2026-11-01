@@ -166,6 +166,8 @@ def check_sram(image):
     submit_sram(t, 1, 0x50011, len(a), len(b))
     t.poll(4)
     assert t.stores == a and t.u32(0x10007ff8) == len(a)
+    t.vp_done(); t.poll()
+    assert t.kicks == [0x2b000400, 0x2b000010, 0x2b000010]
     # Stream B: the host may only run RING_WORDS ahead of the firmware.
     wp = len(a)
     while wp < len(a) + len(b):
@@ -182,8 +184,6 @@ def check_sram(image):
     assert t.stores == a + b, (len(t.stores), len(a) + len(b))
     assert t.u32(0x10007ff8) == len(a) + len(b)
     assert not t.fetches
-    t.vp_done(); t.poll()
-    assert t.kicks == [0x2b000400, 0x2b000010, 0x2b000010]
     t.vp_done(); t.poll()
     t.pp_done(); t.poll()
     assert t.result(0) == [2, 0, 0x50000] and t.notifications == [0x54530000]
@@ -222,9 +222,11 @@ def check(image):
     assert not t.stores and len(t.fetches) == 1
     t.full = False
     t.poll(550)
-    assert t.stores == words + [0xfeed]
-    assert len(t.fetches) == 4 and not t.kicks and not t.notifications
+    assert t.stores == words
+    assert len(t.fetches) == 3 and not t.kicks and not t.notifications
     t.vp_done(); t.poll()
+    t.poll(8)
+    assert t.stores == words + [0xfeed] and len(t.fetches) == 4
     assert t.kicks == [0x2b000400] and not t.notifications
     t.vp_done(); t.poll()
     assert len(t.kicks) == 1

@@ -128,8 +128,8 @@ static void pipeline(void)
 	struct avdq q;
 	struct fake io = {0};
 	struct avdq_desc a = descriptor(0x12340000, 0);
-	struct avdq_desc b = descriptor(0x56780001, 0);
-	struct avdq_desc c = descriptor(0xabcd0002, 1);
+	struct avdq_desc b = descriptor(0x56780001, 1);
+	struct avdq_desc c = descriptor(0xabcd0002, 0);
 	avdq_init(&q);
 	assert(!avdq_submit(&q, 0, &a, 12, 15));
 	assert(!avdq_submit(&q, 1, &b, 12, 15));
@@ -137,11 +137,14 @@ static void pipeline(void)
 	assert(avdq_submit(&q, 0, &b, 12, 15) == -1);
 	step(&q, &io); step(&q, &io); step(&q, &io);
 	assert(q.frame[0].phase == AVDQ_VP && q.frame[1].phase == AVDQ_VP);
-	assert(io.feeds == 3 && !io.kicks && !io.completions);
+	assert(io.feeds == 2 && !io.kicks && !io.completions);
 	/* A later VP can finish first; PP still runs in submission order. */
 	avdq_vp_done(&q, 1); step(&q, &io);
-	assert(!io.kicks && q.frame[2].phase == AVDQ_PP_READY);
-	avdq_vp_done(&q, 0); avdq_vp_done(&q, 0); step(&q, &io);
+	assert(!io.kicks && q.frame[1].phase == AVDQ_PP_READY);
+	assert(!q.frame[2].pushed);
+	avdq_vp_done(&q, 0); step(&q, &io);
+	assert(q.frame[2].phase == AVDQ_VP && io.feeds == 3);
+	avdq_vp_done(&q, 0); step(&q, &io);
 	assert(io.kicks == 1 && io.words[0] == a.pp_kick);
 	assert(q.frame[1].phase == AVDQ_PP_READY);
 	avdq_pp_done(&q); step(&q, &io);
@@ -155,6 +158,36 @@ static void pipeline(void)
 	assert(!q.count && io.completions == 3);
 	assert(io.tags[0] == a.tag && io.tags[1] == b.tag && io.tags[2] == c.tag);
 	assert(!io.statuses[0] && !io.statuses[1] && !io.statuses[2]);
+}
+static void vp_ownership(void)
+{
+	/* SRAM is ordered globally. Do not overwrite a busy VP's picture state,
+	 * or skip its waiting program to reach a different VP's later program. */
+	for (unsigned int depth = 2; depth <= 15; depth++) {
+		struct avdq q;
+		struct fake io = {0};
+		avdq_init(&q);
+		for (unsigned int i = 0; i < depth; i++) {
+			struct avdq_desc d = descriptor(0x100 | i, 4);
+			assert(!avdq_submit(&q, i, &d, 12, 15));
+		}
+		step(&q, &io);
+		for (unsigned int i = 0; i < depth; i++) {
+			assert(q.frame[i].phase == AVDQ_VP);
+			for (unsigned int n = 0; n < 20; n++)
+				step(&q, &io);
+			assert(io.feeds == i + 1);
+			if (i + 1 < depth)
+				assert(!q.frame[i + 1].pushed);
+			avdq_vp_done(&q, 4);
+			step(&q, &io);
+			/* VP of i+1 overlaps PP of i, not VP of i. */
+			assert(io.kicks == i + 1);
+			avdq_pp_done(&q);
+			step(&q, &io);
+		}
+		assert(!q.count && !q.halted && io.completions == depth);
+	}
 }
 static void wrap_and_full(void)
 {
@@ -255,7 +288,7 @@ static void sram_ring(void)
 }
 int main(void)
 {
-	wire(); sram_ring(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
+	vp_ownership(); wire(); sram_ring(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
 	puts("queue: wire, sram ring, validation, pipeline, backpressure, wrap, tags, errors passed");
 	return 0;
 }
