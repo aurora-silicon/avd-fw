@@ -4,7 +4,7 @@
 void avdq_init(struct avdq *q)
 {
 	unsigned int i;
-	q->head = q->count = q->halted = 0;
+	q->head = q->count = q->halted = q->stray_pp = 0;
 	q->pp_active = -1;
 	for (i = 0; i < AVDQ_COUNT; i++)
 		q->frame[i].phase = AVDQ_FREE;
@@ -20,11 +20,19 @@ static int valid(const struct avdq_desc *d, unsigned int idx,
 	if (d->magic != AVDQ_MAGIC || (d->tag & 15u) != idx ||
 	    d->state != AVDQ_SUBMITTED || d->codec > AVDQ_AV1 ||
 	    !(codec_mask & (1u << d->codec)) || d->vp_slot >= vp_count ||
-	    !addr || (addr & 3u) || !d->program_words ||
-	    d->program_words > AVDQ_MAX_WORDS ||
-	    addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES || !d->pp_kick)
+	    !d->program_words || d->program_words > AVDQ_MAX_WORDS ||
+	    !d->pp_kick || (d->flags & ~(AVDQ_FLAG_SRAM | AVDQ_FLAG_VP_DONE)) ||
+	    d->pp_extra > AVDQ_MAX_PP_EXTRA || (d->pp_extra && !d->pp_cont))
 		return 0;
-	for (i = 0; i < 5; i++)
+	if (d->flags & AVDQ_FLAG_SRAM) {
+		/* program_lo is the ring write count at the first word. */
+		if (d->program_hi)
+			return 0;
+	} else if (!addr || (addr & 3u) ||
+		   addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES) {
+		return 0;
+	}
+	for (i = 0; i < 2; i++)
 		if (d->reserved[i])
 			return 0;
 	return 1;
@@ -41,6 +49,7 @@ int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d,
 	f = &q->frame[idx];
 	f->desc = *d;
 	f->pushed = 0;
+	f->vp_notified = 0;
 	f->status = valid(d, idx, vp_count, codec_mask) ? AVDQ_OK : AVDQ_INVALID;
 	f->phase = f->status ? AVDQ_DONE : AVDQ_PENDING;
 	q->order[(q->head + q->count) & (AVDQ_COUNT - 1)] = idx;
@@ -83,7 +92,12 @@ void avdq_pp_done(struct avdq *q)
 	if (q->halted)
 		return;
 	if (q->pp_active < 0) {
-		avdq_fault(q);
+		/*
+		 * Multi-kick frames may raise more than one PP DONE. The legacy
+		 * host completes on the first and ignores the rest; do the same
+		 * rather than poisoning the queue.
+		 */
+		q->stray_pp++;
 		return;
 	}
 	q->frame[q->pp_active].phase = AVDQ_DONE;
@@ -105,22 +119,43 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
 	}
 	if (q->halted)
 		return;
-	for (i = 0; i < q->count; i++) {
+	/*
+	 * PP runs strictly in submission order: a picture's PP may read the
+	 * pictures before it, and with several VPs a later VP can finish first.
+	 */
+	for (i = 0; q->pp_active < 0 && i < q->count; i++) {
 		unsigned int idx = q->order[(q->head + i) & 15u];
 		struct avdq_frame *f = &q->frame[idx];
-		if (f->phase == AVDQ_PP_READY && q->pp_active < 0) {
+		if (f->phase == AVDQ_DONE)
+			continue;
+		if (f->phase == AVDQ_PP_READY) {
 			q->pp_active = (int)idx;
 			f->phase = AVDQ_PP;
-			ops->kick(cookie, f->desc.pp_kick);
-			break;
+			ops->kick(cookie, &f->desc);
 		}
+		break;
 	}
 	/* One SRAM staging buffer; preserve program order across chunks. */
 	for (i = 0; i < q->count; i++) {
 		struct avdq_frame *f = &q->frame[q->order[(q->head + i) & 15u]];
+		unsigned int j;
 		int result;
 		if (f->phase != AVDQ_PENDING && f->phase != AVDQ_PUSH)
 			continue;
+		/*
+		 * FIFO space is not picture completion. A VP still owns its live
+		 * picture state after the last word is fed, until its DONE event.
+		 * Its successor may overlap PP, but must not start on that VP yet.
+		 * Do not skip a blocked program: SRAM words are globally ordered.
+		 */
+		for (j = 0; j < i; j++) {
+			struct avdq_frame *prev =
+				&q->frame[q->order[(q->head + j) & 15u]];
+
+			if (prev->phase == AVDQ_VP &&
+			    prev->desc.vp_slot == f->desc.vp_slot)
+				return;
+		}
 		f->phase = AVDQ_PUSH;
 		result = ops->feed(cookie, f);
 		if (result < 0)

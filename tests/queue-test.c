@@ -20,10 +20,10 @@ static int feed(void *cookie, struct avdq_frame *f)
 	f->pushed++;
 	return f->pushed == f->desc.program_words;
 }
-static void kick(void *cookie, uint32_t word)
+static void kick(void *cookie, const struct avdq_desc *d)
 {
 	struct fake *io = cookie;
-	io->words[io->kicks++] = word;
+	io->words[io->kicks++] = d->pp_kick;
 }
 static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
 {
@@ -86,7 +86,7 @@ static void wire(void)
 static void invalid(void)
 {
 	unsigned int n;
-	for (n = 0; n < 13; n++) {
+	for (n = 0; n < 18; n++) {
 		struct avdq q;
 		struct fake io = {0};
 		struct avdq_desc d = descriptor(0x100, 0);
@@ -104,7 +104,12 @@ static void invalid(void)
 		case 9: d.program_words = AVDQ_MAX_WORDS + 1; break;
 		case 10: d.program_lo = 0xfffffffcu; d.program_hi = 0xffffffffu; break;
 		case 11: d.pp_kick = 0; break;
-		case 12: d.reserved[4] = 1; break;
+		case 12: d.reserved[1] = 1; break;
+		case 13: d.flags = 4; break;
+		case 14: d.pp_extra = AVDQ_MAX_PP_EXTRA + 1; d.pp_cont = 1; break;
+		case 15: d.pp_extra = 1; break; /* continuation word missing */
+		case 16: d.flags = AVDQ_FLAG_SRAM; break; /* program_hi must be 0 */
+		case 17: d.flags = AVDQ_FLAG_SRAM; d.program_hi = 0; d.program_words = 0; break;
 		}
 		assert(!avdq_submit(&q, 0, &d, 9, 7));
 		assert(q.frame[0].phase == AVDQ_DONE);
@@ -123,8 +128,8 @@ static void pipeline(void)
 	struct avdq q;
 	struct fake io = {0};
 	struct avdq_desc a = descriptor(0x12340000, 0);
-	struct avdq_desc b = descriptor(0x56780001, 0);
-	struct avdq_desc c = descriptor(0xabcd0002, 1);
+	struct avdq_desc b = descriptor(0x56780001, 1);
+	struct avdq_desc c = descriptor(0xabcd0002, 0);
 	avdq_init(&q);
 	assert(!avdq_submit(&q, 0, &a, 12, 15));
 	assert(!avdq_submit(&q, 1, &b, 12, 15));
@@ -132,22 +137,57 @@ static void pipeline(void)
 	assert(avdq_submit(&q, 0, &b, 12, 15) == -1);
 	step(&q, &io); step(&q, &io); step(&q, &io);
 	assert(q.frame[0].phase == AVDQ_VP && q.frame[1].phase == AVDQ_VP);
-	assert(io.feeds == 3 && !io.kicks && !io.completions);
-	/* Different VP can finish first; PP runs once at a time. */
+	assert(io.feeds == 2 && !io.kicks && !io.completions);
+	/* A later VP can finish first; PP still runs in submission order. */
 	avdq_vp_done(&q, 1); step(&q, &io);
-	assert(io.kicks == 1 && io.words[0] == c.pp_kick);
-	avdq_vp_done(&q, 0); avdq_vp_done(&q, 0); step(&q, &io);
-	assert(io.kicks == 1 && q.frame[1].phase == AVDQ_PP_READY);
+	assert(!io.kicks && q.frame[1].phase == AVDQ_PP_READY);
+	assert(!q.frame[2].pushed);
+	avdq_vp_done(&q, 0); step(&q, &io);
+	assert(q.frame[2].phase == AVDQ_VP && io.feeds == 3);
+	avdq_vp_done(&q, 0); step(&q, &io);
+	assert(io.kicks == 1 && io.words[0] == a.pp_kick);
+	assert(q.frame[1].phase == AVDQ_PP_READY);
 	avdq_pp_done(&q); step(&q, &io);
-	assert(io.kicks == 2 && io.words[1] == a.pp_kick && !io.completions);
+	assert(io.kicks == 2 && io.words[1] == b.pp_kick && io.completions == 1);
 	avdq_pp_done(&q);
 	io.blocked = 1; step(&q, &io);
-	assert(q.count == 3 && !io.completions && io.kicks == 3);
+	assert(q.count == 2 && io.completions == 1 && io.kicks == 3);
+	assert(io.words[2] == c.pp_kick);
 	io.blocked = 0; step(&q, &io);
 	avdq_pp_done(&q); step(&q, &io); step(&q, &io);
 	assert(!q.count && io.completions == 3);
 	assert(io.tags[0] == a.tag && io.tags[1] == b.tag && io.tags[2] == c.tag);
 	assert(!io.statuses[0] && !io.statuses[1] && !io.statuses[2]);
+}
+static void vp_ownership(void)
+{
+	/* SRAM is ordered globally. Do not overwrite a busy VP's picture state,
+	 * or skip its waiting program to reach a different VP's later program. */
+	for (unsigned int depth = 2; depth <= 15; depth++) {
+		struct avdq q;
+		struct fake io = {0};
+		avdq_init(&q);
+		for (unsigned int i = 0; i < depth; i++) {
+			struct avdq_desc d = descriptor(0x100 | i, 4);
+			assert(!avdq_submit(&q, i, &d, 12, 15));
+		}
+		step(&q, &io);
+		for (unsigned int i = 0; i < depth; i++) {
+			assert(q.frame[i].phase == AVDQ_VP);
+			for (unsigned int n = 0; n < 20; n++)
+				step(&q, &io);
+			assert(io.feeds == i + 1);
+			if (i + 1 < depth)
+				assert(!q.frame[i + 1].pushed);
+			avdq_vp_done(&q, 4);
+			step(&q, &io);
+			/* VP of i+1 overlaps PP of i, not VP of i. */
+			assert(io.kicks == i + 1);
+			avdq_pp_done(&q);
+			step(&q, &io);
+		}
+		assert(!q.count && !q.halted && io.completions == depth);
+	}
 }
 static void wrap_and_full(void)
 {
@@ -218,14 +258,37 @@ static void errors(void)
 	assert(avdq_submit(&q, 0, &a, 12, 15) == -1);
 	avdq_vp_done(&q, 0); avdq_pp_done(&q); /* late events after a fault */
 	assert(!io.kicks);
+	/* A stray PP DONE (multi-kick frames) is counted, not fatal. */
 	avdq_init(&q);
-	avdq_pp_done(&q); assert(q.halted);
+	avdq_pp_done(&q); assert(!q.halted && q.stray_pp == 1);
 	avdq_init(&q);
 	avdq_vp_done(&q, 0); assert(q.halted);
 }
+static void sram_ring(void)
+{
+	struct avdq q;
+	struct fake io = {0};
+	struct avdq_desc d = descriptor(0x40000, 0);
+	d.flags = AVDQ_FLAG_SRAM;
+	d.program_lo = 0xfffffff0u; /* free-running count may wrap */
+	d.program_hi = 0;
+	d.pp_extra = 3;
+	d.pp_cont = 0x2b000000u;
+	avdq_init(&q);
+	assert(!avdq_submit(&q, 0, &d, 12, 15));
+	assert(q.frame[0].phase == AVDQ_PENDING);
+	step(&q, &io);
+	assert(q.frame[0].phase == AVDQ_VP);
+	avdq_vp_done(&q, 0); step(&q, &io);
+	assert(io.kicks == 1 && io.words[0] == d.pp_kick);
+	avdq_pp_done(&q); step(&q, &io);
+	assert(io.completions == 1 && io.statuses[0] == AVDQ_OK);
+	avdq_pp_done(&q); avdq_pp_done(&q); step(&q, &io);
+	assert(!q.halted && q.stray_pp == 2);
+}
 int main(void)
 {
-	wire(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
-	puts("queue: wire, validation, pipeline, backpressure, wrap, tags, errors passed");
+	vp_ownership(); wire(); sram_ring(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
+	puts("queue: wire, sram ring, validation, pipeline, backpressure, wrap, tags, errors passed");
 	return 0;
 }

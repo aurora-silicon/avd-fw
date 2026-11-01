@@ -1,4 +1,4 @@
-# Open firmware frame queue, ABI 1
+# Open firmware frame queue, ABI 2
 
 This is the MIT open backend protocol, not an Apple firmware ABI. All words are
 little endian. It preserves legacy `0x100 | vp` / `0x1000` interrupt messages
@@ -17,7 +17,7 @@ information block at SRAM `+0x7fc0` before raising the existing boot-ready flag:
 | Offset | u32 value |
 | --- | --- |
 | 0x00 | magic `0x41565131` (`AVQ1`), published last |
-| 0x04 | ABI version, 1 |
+| 0x04 | ABI version, 2 (ABI 1 plus the SRAM ring and multi-kick PP) |
 | 0x08 | descriptor count, 16 |
 | 0x0c | descriptor stride, 64 |
 | 0x10 | SRAM aperture address in the four-byte doorbell address space |
@@ -27,7 +27,11 @@ information block at SRAM `+0x7fc0` before raising the existing boot-ready flag:
 | 0x20 | VP register index limit (exclusive), 4 / 9 / 12 |
 | 0x24 | codec mask: bits HEVC=0, H.264=1, VP9=2, AV1=3 |
 | 0x28 | hardware FIFO slots: cap frames in flight at min(16, this) |
-| 0x2c..0x3c | reserved, zero |
+| 0x2c | features: bit 0 SRAM ring, bit 1 multi-kick PP |
+| 0x30 | SRAM ring offset, `0x0` |
+| 0x34 | SRAM ring size in words, `0x1800` (24 KiB) |
+| 0x38 | firmware: SRAM ring words consumed (free-running, live) |
+| 0x3c | host: SRAM ring words written (free-running, host-owned) |
 
 Read the block after boot-ready. Missing magic means old firmware: use the
 legacy backend, or reject queue mode. An unknown version must not be submitted.
@@ -80,7 +84,10 @@ Each descriptor is exactly 16 u32 words (`struct avdq_desc` in `src/queue.h`):
 | 0x20 | state | host publishes 1 (SUBMITTED); firmware publishes 2 (COMPLETE) |
 | 0x24 | status | firmware: 0 success, 1 invalid descriptor, 2 fatal pipeline I/O |
 | 0x28 | completion_tag | firmware: full unmodified 32-bit submitted tag |
-| 0x2c..0x3c | reserved[5] | host: zero |
+| 0x2c | flags | host: bit 0 = program is in the SRAM ring (ABI 2) |
+| 0x30 | pp_extra | host: continuation PP kicks after pp_kick, 0..255 (ABI 2) |
+| 0x34 | pp_cont | host: continuation PP kick word, nonzero if pp_extra (ABI 2) |
+| 0x38..0x3c | reserved[2] | host: zero |
 
 The host can choose any free index; doorbell arrival defines submission order.
 There is no shared producer counter or sentinel entry: all 16 entries can be
@@ -123,6 +130,39 @@ Reject/retain locally when no descriptor/FIFO/mailbox capacity is available.
 The firmware doorbell ISR only puts the index into its 16-entry inbox and
 acknowledges the interrupt. Descriptor copies, DMA polling, and scheduling happen
 in the foreground so slow fetches/FIFO pressure cannot block completion IRQs.
+
+## SRAM ring (ABI 2)
+
+PIODMA fetches need the decoder's second DART stream, which the device trees
+in use do not describe yet. ABI 2 adds a mode that needs no DMA at all: the
+host streams each program into a word ring in CM3 SRAM and the firmware copies
+it to the VP FIFO from there.
+
+* The ring is SRAM `+0x0000..+0x5fff`, 0x1800 words. Queue mode never runs the
+  Tansy diagnostic commands, so nothing else uses that range; firmware never
+  writes it.
+* Two free-running u32 word counters: the host's write count at info `+0x3c`
+  and the firmware's read count at info `+0x38`. Word `n` lives at ring word
+  `n % 0x1800`. Both start at 0 after every firmware boot.
+* A ring descriptor sets `flags` bit 0, `program_hi` = 0 and `program_lo` = the
+  write count of its first word. Firmware faults the queue (status 2) if that
+  does not equal its read count when the frame starts, so programs are consumed
+  in exactly doorbell order. Submit descriptors in the same order their words
+  were placed.
+* The host may ring the doorbell before the whole program is in the ring and
+  keep streaming: it may run at most 0x1800 words ahead of the read count, and
+  must publish the write count (after `wmb()`) as it goes. Programs of any
+  length up to `AVDQ_MAX_WORDS` work this way. The firmware copies at most 64
+  words per scheduler step, stops at the host's write count and at the VP FIFO
+  capacity, and waits otherwise; the host's per-frame watchdog covers a stall.
+* PIODMA descriptors (`flags` = 0) keep the ABI 1 rules. Do not mix the two in
+  one session.
+
+Multi-kick PP: codecs that issue one PP EXEC per tile or segment set `pp_extra`
+to the number of continuation kicks and `pp_cont` to that word. Firmware writes
+`pp_kick` then `pp_extra` copies of `pp_cont`, the same sequence the legacy host
+wrote after VP DONE. A frame completes on its first PP DONE; further PP DONEs
+while no frame is in PP are counted and ignored, as the legacy host did.
 
 ## Program packets and PIODMA
 
@@ -236,13 +276,19 @@ lead's device tests. No hardware was requested for this change.
 Requirements: Clang with the ARM bare-metal target, LLD, llvm-objcopy, a native C
 compiler, Meson >=1.4, Ninja. Keep LLVM/LLD tools on PATH.
 
+The Makefile and Meson (with `llvm.ini` and its default options) build the same
+images byte for byte. Do not pass `--buildtype` or `-Doptimization` to Meson,
+and do not let a distribution inject its own CFLAGS: either changes the code.
+`arm-none-eabi-gcc.ini` is a GCC alternative and produces different images.
+
 ```sh
 make test
 sh tests/build-all.sh
 python3 tests/check-images.py build/avd-fw-*.bin
-meson setup build/meson --cross-file llvm.ini --buildtype=release
+meson setup build/meson --cross-file llvm.ini
 meson compile -C build/meson
 meson test -C build/meson --print-errorlogs
+sh tests/check-reproducible.sh   # Make and Meson images must be byte-identical
 
 # Optional integration test of actual ARM machine code, with synthetic MMIO:
 python3 -m venv build/test-venv
@@ -288,3 +334,14 @@ the input or output format. Use the existing core's trace/debug instrumentation
 to record maximum in-flight count and tag correlation; ABI 1 adds no queue-depth
 module parameter. To measure steady-state decode independently of output disk
 I/O, repeat the hardware decode with `-benchmark -f null -` as the output.
+
+### VP picture ownership
+
+A fully fed program still owns its VP until that VP's DONE event. FIFO capacity
+only permits more words; it does not release the VP's live picture state.
+The foreground scheduler therefore leaves a successor pending when an earlier
+frame on the same VP is in `AVDQ_VP`. After DONE it can feed the successor while
+the earlier picture is PP-ready or running PP. Independent VPs can still run
+concurrently. A blocked program cannot be skipped because the SRAM word ring is
+in global submission order. The host watchdog continues to bound a missing
+DONE; errors halt all accepted work as before.

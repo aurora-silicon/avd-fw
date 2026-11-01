@@ -4,7 +4,7 @@
 
 #include <stdint.h>
 
-#define AVDQ_VERSION 1u
+#define AVDQ_VERSION 2u
 #define AVDQ_MAGIC 0x41565131u /* AVQ1 */
 #define AVDQ_COUNT 16u
 #define AVDQ_DESC_BYTES 64u
@@ -15,6 +15,22 @@
 #define AVDQ_MAX_WORDS 0x100000u
 #define AVDQ_NOTIFY 0x54530000u
 #define AVDQ_FATAL 0x5452ffffu
+
+/*
+ * ABI 2 SRAM ring: the host streams instruction words straight into CM3 SRAM
+ * (no PIODMA, so no second DART stream is needed). Free-running word counters
+ * live in the info block: firmware read count at info+0x38, host write count
+ * at info+0x3c.
+ */
+#define AVDQ_FLAG_SRAM 1u
+#define AVDQ_FEAT_SRAM_RING 1u
+#define AVDQ_FEAT_VP_DONE (1u << 2)
+#define AVDQ_FLAG_VP_DONE (1u << 1)
+#define AVDQ_VP_NOTIFY 0x54540000u
+#define AVDQ_FEAT_MULTI_KICK 2u
+#define AVDQ_SRAM_RING_OFFSET 0x0u
+#define AVDQ_SRAM_RING_WORDS 0x1800u
+#define AVDQ_MAX_PP_EXTRA 255u
 
 #define AVDQ_SUBMITTED 1u
 #define AVDQ_COMPLETE 2u
@@ -28,7 +44,9 @@ enum avdq_codec { AVDQ_HEVC, AVDQ_H264, AVDQ_VP9, AVDQ_AV1 };
 struct avdq_desc {
 	uint32_t magic, tag, codec, vp_slot;
 	uint32_t program_lo, program_hi, program_words, pp_kick;
-	uint32_t state, status, completion_tag, reserved[5];
+	uint32_t state, status, completion_tag;
+	/* ABI 2: AVDQ_FLAG_*, continuation PP kick count and word. */
+	uint32_t flags, pp_extra, pp_cont, reserved[2];
 };
 _Static_assert(sizeof(struct avdq_desc) == AVDQ_DESC_BYTES, "wire size");
 
@@ -63,19 +81,21 @@ enum avdq_phase { AVDQ_FREE, AVDQ_PENDING, AVDQ_PUSH, AVDQ_VP,
 	AVDQ_PP_READY, AVDQ_PP, AVDQ_DONE };
 struct avdq_frame {
 	struct avdq_desc desc;
-	uint32_t phase, pushed, status;
+	uint32_t phase, pushed, status, vp_notified;
 };
 struct avdq {
 	struct avdq_frame frame[AVDQ_COUNT];
 	uint32_t order[AVDQ_COUNT], head, count, halted;
 	int pp_active;
+	unsigned int stray_pp;
 };
 
 /* Single owner: IRQs only latch events, the foreground calls these methods. */
 struct avdq_ops {
 	/* Feed a bounded amount: 0 waiting, 1 all words sent, -1 fatal I/O. */
 	int (*feed)(void *cookie, struct avdq_frame *f);
-	void (*kick)(void *cookie, uint32_t word);
+	/* Write the frame's PP kick and its continuation kicks. */
+	void (*kick)(void *cookie, const struct avdq_desc *d);
 	/* Must publish record before notification; return 0 if outbox full. */
 	int (*complete)(void *cookie, unsigned int idx,
 			const struct avdq_frame *f);

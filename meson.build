@@ -1,4 +1,9 @@
-project('avd-fw', 'c', default_options: ['c_std=c11'], meson_version: '>=1.4.0', version: '0.1')
+# optimization=2 and debug=false match the Makefile (-O2, no -g), so both build
+# systems produce byte-identical images; tests/check-reproducible.sh checks it.
+# Meson's own default (buildtype=debug: -O0 -g) would ship different firmware.
+project('avd-fw', 'c',
+    default_options: ['c_std=c11', 'optimization=2', 'debug=false'],
+    meson_version: '>=1.4.0', version: '0.1')
 
 # cross files are needed as those are the only way to set default compiler
 # and specify the host arch

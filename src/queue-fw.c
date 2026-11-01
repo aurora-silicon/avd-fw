@@ -55,6 +55,13 @@
 		   AVDQ_RING_OFFSET + (i) * AVDQ_DESC_BYTES))
 #define Q_STAGE REG(SRAM_ALIAS + AVDQ_STAGE_OFFSET)
 #define Q_INFO REG(SRAM_ALIAS + 0x7fc0u)
+#define Q_RING_WORD REG(SRAM_ALIAS + AVDQ_SRAM_RING_OFFSET)
+#define Q_INFO_RP 14	/* firmware: ring words consumed */
+#define Q_INFO_WP 15	/* host: ring words written */
+/* Words fed per foreground step before interrupts are serviced again. */
+#define Q_FEED_BATCH 64u
+_Static_assert(AVDQ_SRAM_RING_OFFSET + AVDQ_SRAM_RING_WORDS * 4u <= 0x6000u,
+	       "SRAM ring overlaps queue state");
 
 /* Explicit SRAM placement: no dependency on the legacy uninitialized BSS. */
 struct queue_fw {
@@ -63,6 +70,7 @@ struct queue_fw {
 	volatile unsigned int inbox[AVDQ_COUNT];
 	volatile unsigned int vp_done[12], pp_done, error;
 	unsigned int dma_pending, dma_wait, stage_words, stage_used;
+	unsigned int ring_rp;	/* SRAM ring words consumed (free-running) */
 };
 #define FW ((struct queue_fw *)(SRAM_ALIAS + 0x6000u))
 _Static_assert(sizeof(struct queue_fw) <= 0x1fc0u, "SRAM queue state overlaps ABI");
@@ -91,8 +99,34 @@ void avdq_fw_init(void)
 	Q_INFO[8] = VP_COUNT;
 	Q_INFO[9] = AVD_VER <= 3 ? 7u : 15u;
 	Q_INFO[10] = FIFO_SLOTS;
+	Q_INFO[11] = AVDQ_FEAT_SRAM_RING | AVDQ_FEAT_MULTI_KICK |
+		     AVDQ_FEAT_VP_DONE;
+	Q_INFO[12] = AVDQ_SRAM_RING_OFFSET;
+	Q_INFO[13] = AVDQ_SRAM_RING_WORDS;
 	barrier();
 	Q_INFO[0] = AVDQ_MAGIC;
+}
+
+/* The CM3 interrupt router is separate from the NVIC and decoder masks. */
+static void queue_enable_irq(unsigned int irq)
+{
+	unsigned int bank = (irq - 14u) / 32u;
+	unsigned int mask = 1u << ((irq - 14u) % 32u);
+
+	reg_write(CM3_MBOX_IRQEN(bank), reg_read(CM3_MBOX_IRQEN(bank)) | mask);
+}
+
+static void queue_enable_irqs(unsigned int vp)
+{
+	unsigned int event, first;
+
+	/* Enable only a validated descriptor's VP, not holes in the VP limit. */
+	first = (AVD_VER == 2 ? 18u : 78u) + vp * 5u;
+	for (event = 0; event < 3; event++)
+		queue_enable_irq(first + event); /* unknown/error/DONE, not FULL */
+	first = AVD_VER == 2 ? 38u : 62u;
+	queue_enable_irq(first); /* PP unknown */
+	queue_enable_irq(first + 2u); /* PP DONE */
 }
 
 int avdq_fw_mailbox(unsigned int token)
@@ -101,6 +135,11 @@ int avdq_fw_mailbox(unsigned int token)
 	unsigned int write;
 	if (idx < 0)
 		return FW->mode != 0; /* Never run Tansy resets during a queue session. */
+	if (!FW->mode) {
+		/* Queue mode owns these routes; legacy mode before it is unchanged. */
+		for (unsigned int i = 0; i < 6; i++)
+			reg_write(CM3_MBOX_IRQEN(i), 0);
+	}
 	FW->mode = 1;
 	write = FW->in_write;
 	if (write - FW->in_read >= AVDQ_COUNT) {
@@ -131,11 +170,51 @@ int avdq_fw_event(unsigned int vp, unsigned int event)
 	return 1;
 }
 
+/*
+ * ABI 2 SRAM ring: the host has already streamed (or is still streaming) the
+ * program into the ring at SRAM +0. Copy up to Q_FEED_BATCH words per step
+ * into the VP FIFO, never past the host's write count or the FIFO capacity.
+ */
+static int feed_sram(struct queue_fw *fw, struct avdq_frame *f)
+{
+	unsigned int max, cur, avail, n;
+	if (!f->pushed && f->desc.program_lo != fw->ring_rp)
+		return -1; /* host and firmware disagree about the ring position */
+	avail = Q_INFO[Q_INFO_WP] - fw->ring_rp;
+	if (avail > AVDQ_SRAM_RING_WORDS)
+		return -1;
+	if (!avail)
+		return 0; /* host is still writing; its watchdog covers a stall */
+	if (avail > f->desc.program_words - f->pushed)
+		avail = f->desc.program_words - f->pushed;
+	if (avail > Q_FEED_BATCH)
+		avail = Q_FEED_BATCH;
+	barrier();
+	for (n = 0; n < avail; n++) {
+		max = reg_read(REG(DECODE_CTRL_BASE + FIFO_MAX + f->desc.vp_slot * 4u));
+		cur = reg_read(REG(DECODE_CTRL_BASE + FIFO_CUR + f->desc.vp_slot * 4u));
+		if (!max || cur >= max)
+			break;
+		reg_write(REG(DECODE_CTRL_BASE + VP_FIFO + f->desc.vp_slot * 4u),
+			  Q_RING_WORD[fw->ring_rp % AVDQ_SRAM_RING_WORDS]);
+		__asm volatile("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop" ::: "memory");
+		fw->ring_rp++;
+		f->pushed++;
+	}
+	if (n) {
+		barrier();
+		Q_INFO[Q_INFO_RP] = fw->ring_rp;
+	}
+	return f->pushed == f->desc.program_words;
+}
+
 static int feed(void *cookie, struct avdq_frame *f)
 {
 	struct queue_fw *fw = cookie;
 	unsigned int words, max, cur;
 	uint64_t addr;
+	if (f->desc.flags & AVDQ_FLAG_SRAM)
+		return feed_sram(fw, f);
 	if (fw->stage_used == fw->stage_words) {
 		if (!fw->dma_pending) {
 			words = f->desc.program_words - f->pushed;
@@ -178,17 +257,47 @@ static int feed(void *cookie, struct avdq_frame *f)
 	return 0;
 }
 
-static void kick(void *cookie, uint32_t word)
+static void kick(void *cookie, const struct avdq_desc *d)
 {
+	unsigned int i;
 	(void)cookie;
-	reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), word);
+	reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), d->pp_kick);
+	/* Same continuation EXEC words the legacy host wrote, one per segment. */
+	for (i = 0; i < d->pp_extra; i++)
+		reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), d->pp_cont);
+}
+
+/* VP records do not release any descriptor or DMA storage. */
+static void notify_vp(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < FW->q.count; i++) {
+		unsigned int idx = FW->q.order[(FW->q.head + i) & 15u];
+		struct avdq_frame *f = &FW->q.frame[idx];
+		volatile struct avdq_desc *d = Q_DESC(idx);
+
+		if (!(f->desc.flags & AVDQ_FLAG_VP_DONE) || f->vp_notified ||
+		    f->status || (f->phase != AVDQ_PP_READY &&
+		    f->phase != AVDQ_PP && f->phase != AVDQ_DONE))
+			continue;
+		if (!(reg_read(CM3_MBOX1_STATUS) & CM3_MBOX_STATUS_EMPTY))
+			return;
+		d->reserved[0] = f->desc.tag;
+		barrier();
+		d->reserved[1] = 1;
+		barrier();
+		reg_write(CM3_MBOX1_TX, AVDQ_VP_NOTIFY | (f->desc.tag & 0xfff0u) | idx);
+		f->vp_notified = 1;
+		return;
+	}
 }
 
 static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
 {
 	volatile struct avdq_desc *d = Q_DESC(idx);
 	(void)cookie;
-	if (!(reg_read(CM3_MBOX1_STATUS) & CM3_MBOX1_EMPTY))
+	if (!(reg_read(CM3_MBOX1_STATUS) & CM3_MBOX_STATUS_EMPTY))
 		return 0;
 	d->status = f->status;
 	d->completion_tag = f->desc.tag;
@@ -235,13 +344,16 @@ int avdq_fw_poll(void)
 		if (avdq_submit(&FW->q, idx, &d, VP_COUNT, AVD_VER <= 3 ? 7u : 15u)) {
 			FW->fatal = 1;
 			avdq_fault(&FW->q);
+		} else if (FW->q.frame[idx].status == AVDQ_OK) {
+			queue_enable_irqs(d.vp_slot);
 		}
 		/* Queue mode owns PIODMA; the Tansy transport cannot run concurrently. */
 		reg_write(Q_DMA(0x00), reg_read(Q_DMA(0x00)) & ~1u);
 	}
+	notify_vp();
 	avdq_step(&FW->q, &ops, FW);
 	if (FW->fatal && !FW->q.count &&
-	    (reg_read(CM3_MBOX1_STATUS) & CM3_MBOX1_EMPTY)) {
+	    (reg_read(CM3_MBOX1_STATUS) & CM3_MBOX_STATUS_EMPTY)) {
 		reg_write(CM3_MBOX1_TX, AVDQ_FATAL);
 		FW->fatal = 0;
 	}
