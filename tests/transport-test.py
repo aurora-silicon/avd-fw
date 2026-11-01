@@ -76,7 +76,7 @@ class Transport:
             self.put(addr, 0)
             self.clear.remove(addr)
         if addr == 0x5001005c:
-            self.put(addr, 0 if self.busy else 4)
+            self.put(addr, 0x10101 if self.busy else 0x20001)
         if self.decode + self.maximum <= addr < self.decode + self.maximum + self.vps * 4:
             self.put(addr, 256)
         if self.decode + self.current <= addr < self.decode + self.current + self.vps * 4:

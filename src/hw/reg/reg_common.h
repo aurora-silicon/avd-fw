@@ -34,6 +34,9 @@
 #define CM3_MBOX1_EMPTY		BIT(2)
 #define CM3_MBOX1_NOT_EMPTY	BIT(3)
 
+/* FIFO status is separate from the mailbox IRQ-source bits above. */
+#define CM3_MBOX_STATUS_EMPTY	BIT(17)
+
 #define DECODE_STATUS_UNK	BIT(0)
 #define DECODE_STATUS_ERR	BIT(1)
 #define DECODE_STATUS_DONE	BIT(2)

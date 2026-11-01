@@ -106,12 +106,39 @@ void avdq_fw_init(void)
 	Q_INFO[0] = AVDQ_MAGIC;
 }
 
+/* The CM3 interrupt router is separate from the NVIC and decoder masks. */
+static void queue_enable_irq(unsigned int irq)
+{
+	unsigned int bank = (irq - 14u) / 32u;
+	unsigned int mask = 1u << ((irq - 14u) % 32u);
+
+	reg_write(CM3_MBOX_IRQEN(bank), reg_read(CM3_MBOX_IRQEN(bank)) | mask);
+}
+
+static void queue_enable_irqs(unsigned int vp)
+{
+	unsigned int event, first;
+
+	/* Enable only a validated descriptor's VP, not holes in the VP limit. */
+	first = (AVD_VER == 2 ? 18u : 78u) + vp * 5u;
+	for (event = 0; event < 3; event++)
+		queue_enable_irq(first + event); /* unknown/error/DONE, not FULL */
+	first = AVD_VER == 2 ? 38u : 62u;
+	queue_enable_irq(first); /* PP unknown */
+	queue_enable_irq(first + 2u); /* PP DONE */
+}
+
 int avdq_fw_mailbox(unsigned int token)
 {
 	int idx = avdq_index(token, Q_RING);
 	unsigned int write;
 	if (idx < 0)
 		return FW->mode != 0; /* Never run Tansy resets during a queue session. */
+	if (!FW->mode) {
+		/* Queue mode owns these routes; legacy mode before it is unchanged. */
+		for (unsigned int i = 0; i < 6; i++)
+			reg_write(CM3_MBOX_IRQEN(i), 0);
+	}
 	FW->mode = 1;
 	write = FW->in_write;
 	if (write - FW->in_read >= AVDQ_COUNT) {
@@ -243,7 +270,7 @@ static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
 {
 	volatile struct avdq_desc *d = Q_DESC(idx);
 	(void)cookie;
-	if (!(reg_read(CM3_MBOX1_STATUS) & CM3_MBOX1_EMPTY))
+	if (!(reg_read(CM3_MBOX1_STATUS) & CM3_MBOX_STATUS_EMPTY))
 		return 0;
 	d->status = f->status;
 	d->completion_tag = f->desc.tag;
@@ -290,13 +317,15 @@ int avdq_fw_poll(void)
 		if (avdq_submit(&FW->q, idx, &d, VP_COUNT, AVD_VER <= 3 ? 7u : 15u)) {
 			FW->fatal = 1;
 			avdq_fault(&FW->q);
+		} else if (FW->q.frame[idx].status == AVDQ_OK) {
+			queue_enable_irqs(d.vp_slot);
 		}
 		/* Queue mode owns PIODMA; the Tansy transport cannot run concurrently. */
 		reg_write(Q_DMA(0x00), reg_read(Q_DMA(0x00)) & ~1u);
 	}
 	avdq_step(&FW->q, &ops, FW);
 	if (FW->fatal && !FW->q.count &&
-	    (reg_read(CM3_MBOX1_STATUS) & CM3_MBOX1_EMPTY)) {
+	    (reg_read(CM3_MBOX1_STATUS) & CM3_MBOX_STATUS_EMPTY)) {
 		reg_write(CM3_MBOX1_TX, AVDQ_FATAL);
 		FW->fatal = 0;
 	}
