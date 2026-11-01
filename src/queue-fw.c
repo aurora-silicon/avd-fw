@@ -55,6 +55,7 @@
 		   AVDQ_RING_OFFSET + (i) * AVDQ_DESC_BYTES))
 #define Q_STAGE REG(SRAM_ALIAS + AVDQ_STAGE_OFFSET)
 #define Q_INFO REG(SRAM_ALIAS + 0x7fc0u)
+#define Q_POOL REG(SRAM_ALIAS + AVDQ_POOL_OFFSET)
 #define Q_RING_WORD REG(SRAM_ALIAS + AVDQ_SRAM_RING_OFFSET)
 #define Q_INFO_RP 14	/* firmware: ring words consumed */
 #define Q_INFO_WP 15	/* host: ring words written */
@@ -73,7 +74,7 @@ struct queue_fw {
 	unsigned int ring_rp;	/* SRAM ring words consumed (free-running) */
 };
 #define FW ((struct queue_fw *)(SRAM_ALIAS + 0x6000u))
-_Static_assert(sizeof(struct queue_fw) <= 0x1fc0u, "SRAM queue state overlaps ABI");
+_Static_assert(sizeof(struct queue_fw) <= AVDQ_POOL_OFFSET - 0x6000u, "SRAM queue state overlaps ABI");
 
 static void barrier(void)
 {
@@ -86,7 +87,13 @@ void avdq_fw_init(void)
 	volatile unsigned int *p = (volatile unsigned int *)FW;
 	for (i = 0; i < sizeof(*FW) / sizeof(*p); i++)
 		p[i] = 0;
-	avdq_init(&FW->q);
+	avdq_init(&FW->q, AVDQ_IMAGE_POOL);
+	Q_POOL[0] = 0;
+	Q_POOL[1] = AVDQ_POOL_VERSION;
+	for (i = 0; i < 4; i++)
+		Q_POOL[2 + i] = AVDQ_IMAGE_POOL->codec[i];
+	Q_POOL[6] = AVDQ_IMAGE_POOL->inferred;
+	Q_POOL[7] = 0;
 	for (i = 0; i < 16; i++)
 		Q_INFO[i] = 0;
 	Q_INFO[1] = AVDQ_VERSION;
@@ -100,10 +107,11 @@ void avdq_fw_init(void)
 	Q_INFO[9] = AVD_VER <= 3 ? 7u : 15u;
 	Q_INFO[10] = FIFO_SLOTS;
 	Q_INFO[11] = AVDQ_FEAT_SRAM_RING | AVDQ_FEAT_MULTI_KICK |
-		     AVDQ_FEAT_VP_DONE;
+		     AVDQ_FEAT_VP_DONE | AVDQ_FEAT_MULTI_VP;
 	Q_INFO[12] = AVDQ_SRAM_RING_OFFSET;
 	Q_INFO[13] = AVDQ_SRAM_RING_WORDS;
 	barrier();
+	Q_POOL[0] = AVDQ_POOL_MAGIC;
 	Q_INFO[0] = AVDQ_MAGIC;
 }
 

@@ -1,16 +1,17 @@
 /* SPDX-License-Identifier: MIT */
 #include "queue.h"
 
-void avdq_init(struct avdq *q)
+void avdq_init(struct avdq *q, const struct avdq_pool *pool)
 {
 	unsigned int i;
+	q->pool = pool;
 	q->head = q->count = q->halted = q->stray_pp = 0;
 	q->pp_active = -1;
 	for (i = 0; i < AVDQ_COUNT; i++)
 		q->frame[i].phase = AVDQ_FREE;
 }
 
-static int valid(const struct avdq_desc *d, unsigned int idx,
+static int valid(const struct avdq *q, const struct avdq_desc *d, unsigned int idx,
 		 unsigned int vp_count, unsigned int codec_mask)
 {
 	uint64_t addr = ((uint64_t)d->program_hi << 32) | d->program_lo;
@@ -23,6 +24,8 @@ static int valid(const struct avdq_desc *d, unsigned int idx,
 	    !d->program_words || d->program_words > AVDQ_MAX_WORDS ||
 	    !d->pp_kick || (d->flags & ~(AVDQ_FLAG_SRAM | AVDQ_FLAG_VP_DONE)) ||
 	    d->pp_extra > AVDQ_MAX_PP_EXTRA || (d->pp_extra && !d->pp_cont))
+		return 0;
+	if (q->pool && !(q->pool->codec[d->codec] & (1u << d->vp_slot)))
 		return 0;
 	if (d->flags & AVDQ_FLAG_SRAM) {
 		/* program_lo is the ring write count at the first word. */
@@ -50,7 +53,7 @@ int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d,
 	f->desc = *d;
 	f->pushed = 0;
 	f->vp_notified = 0;
-	f->status = valid(d, idx, vp_count, codec_mask) ? AVDQ_OK : AVDQ_INVALID;
+	f->status = valid(q, d, idx, vp_count, codec_mask) ? AVDQ_OK : AVDQ_INVALID;
 	f->phase = f->status ? AVDQ_DONE : AVDQ_PENDING;
 	q->order[(q->head + q->count) & (AVDQ_COUNT - 1)] = idx;
 	q->count++;
