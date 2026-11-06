@@ -149,6 +149,37 @@ void avd_reset_decoder_blocks(void)
 }
 #endif
 
+
+#if AVD_VER == 5 && AVD_TIER == 2
+/*
+ * EXPERIMENT (not for merge): global decoder initialisation also sets bit 30
+ * in the PP MODE registers and the active DMA-channel control words (clean
+ * ledger DAYBREAK-H264-PP.md section 2.3). R_ZIP (0xe980) is left alone.
+ */
+static const unsigned short bit30_offs[] = {
+	0x4000, 0x4100, 0x4200, 0x4300, 0x4400, 0x4500, 0x4600, 0x4700,
+	0xc080, 0xc0c0, 0xc180, 0xc1c0, 0xc280, 0xc380, 0xc480, 0xc580,
+	0xc680, 0xc6c0, 0xc700, 0xc740, 0xc780, 0xc7c0, 0xc800, 0xc840,
+	0xc880, 0xc8c0, 0xc900, 0xca00, 0xcb00, 0xcc00, 0xcd00, 0xce00,
+	0xcf00, 0xd000, 0xd100, 0xd200, 0xd300, 0xd400, 0xd500, 0xd540,
+	0xe080, 0xe0c0, 0xe100, 0xe140, 0xe180, 0xe1c0, 0xe200, 0xe240,
+	0xe280, 0xe2c0, 0xe300, 0xe340, 0xe380, 0xe3c0, 0xe400, 0xe440,
+	0xe480, 0xe4c0, 0xe500, 0xe540, 0xe580, 0xe5c0, 0xe600, 0xe640,
+	0xe680, 0xe6c0, 0xe700, 0xe740, 0xe880, 0xe8c0, 0xe900, 0xe940,
+};
+
+static void apply_bit30(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < sizeof(bit30_offs) / sizeof(bit30_offs[0]); i++) {
+		u32 *reg = REG(DECODE_CTRL_BASE + bit30_offs[i]);
+
+		reg_write(reg, reg_read(reg) | 0x40000000);
+	}
+}
+#endif
+
 void _start(void)
 {
 	/* Tansy explicitly restores the architectural vector base on each boot. */
@@ -157,6 +188,9 @@ void _start(void)
 	apply_tunables();
 #if AVD_VER == 5
 	apply_piodma_tunables();
+#endif
+#if AVD_VER == 5 && AVD_TIER == 2
+	apply_bit30();
 #endif
 	/* Match Tansy's mailbox-0 doorbell enables (not-empty plus channel 5). */
 	reg_write(CM3_MBOX_IRQEN_0, 0x22);
