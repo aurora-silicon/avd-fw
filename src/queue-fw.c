@@ -19,7 +19,8 @@
 #define FIFO_MAX 0x34u
 #define FIFO_CUR 0x5cu
 #else
-#if AVD_VER == 5 && AVD_TIER == 0
+#if AVD_VER == 4 || (AVD_VER == 5 && AVD_TIER == 0)
+/* T8122 (v4) and T8140 (v5-t0): 0x10000-byte code window, SRAM at +0x90000. */
 #define SRAM_APERTURE 0x01090000u
 #elif AVD_VER == 5 && AVD_TIER == 2
 /* T6040/T6041: 0x14000-byte code window, so SRAM starts at +0x94000. */

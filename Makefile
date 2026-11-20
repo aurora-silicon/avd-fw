@@ -15,6 +15,10 @@ ifeq ($(AVD_VER),3)
 PAD = 0x10000
 endif
 
+ifeq ($(AVD_VER),4)
+PAD = 0x10000
+endif
+
 ifeq ($(AVD_VER),5)
 ifeq ($(AVD_TIER),0)
 PAD = 0x10000

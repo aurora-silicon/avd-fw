@@ -50,13 +50,13 @@ Current firmware aperture addresses are:
 | --- | --- | --- | --- |
 | v2-t0 | `0x0108c000` | `0x40070000` | `0x4004 + 4*vp` / `0x4014` |
 | v3-t0, v3-t1, v3-t2 | `0x01090000` | `0x40070000` | `0x000c + 4*vp` / `0x0030` |
-| v4-t0 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
+| v4-t0 | `0x01090000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
 | v5-t0 | `0x01090000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
 | v5-t1 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
 | v5-t2 (T6040/T6041) | `0x01094000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
 
 The aperture must match the SoC's DT `sram` offset from the AVD base
-(+0x90000 on T6000, T8112 and T8140; +0x92000 on T8132; +0x94000 on T6040),
+(+0x90000 on T6000, T8112, T8122 and T8140; +0x92000 on T8132; +0x94000 on T6040),
 because the PIODMA destination header is an address in that space. T6040 must
 load `avd-fw-v5-t2` for queue mode: `avd-fw-v5-t1` would place staged words
 0x2000 bytes low, inside the firmware's private state. Legacy mode does not
