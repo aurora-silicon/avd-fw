@@ -300,7 +300,7 @@ For the Linux lead, after implementing this ABI and before device qualification:
 
 ```sh
 make O=out ARCH=arm64 LLVM=1 defconfig
-make O=out ARCH=arm64 LLVM=1 asahi.config
+make O=out ARCH=arm64 LLVM=1 aurora.config
 make O=out ARCH=arm64 LLVM=1 -j8 Image modules dtbs
 ```
 
